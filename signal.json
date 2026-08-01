@@ -10,6 +10,8 @@
   "direction": "long",
   "confidence": 0.82,
   "suggested_size": 0.014,
+  "execution_price": 1.08950,
+  "execution_status": "filled",
   "sl": 1.08700,
   "tp": 1.09500,
   "explanation": {
