@@ -1,0 +1,38 @@
+{
+  "signal_id": "uuid-1234",
+  "engine": "SMC-ICT",
+  "engine_version": "v1.2",
+  "pair": "EURUSD",
+  "timeframe": "1H",
+  "timestamp": "2026-08-01T12:30:00Z",
+  "sent_at": "2026-08-01T12:30:02Z",
+  "executed_at": "2026-08-01T12:31:07Z",
+  "direction": "long",
+  "confidence": 0.82,
+  "suggested_size": 0.014,
+  "sl": 1.08700,
+  "tp": 1.09500,
+  "explanation": {
+    "components": [
+      {
+        "name": "HTFStructure",
+        "weight": 0.4,
+        "note": "Higher timeframe bullish"
+      },
+      {
+        "name": "OrderFlow",
+        "weight": 0.3,
+        "note": "Buying imbalance"
+      },
+      {
+        "name": "NewsFilter",
+        "weight": -0.1,
+        "note": "Minor news in 1h"
+      }
+    ],
+    "ml_shap_summary": "Top positive features: HTFStructure, OrderFlow..."
+  },
+  "payload": {
+    "raw": "engine specific data"
+  }
+}
