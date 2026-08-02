@@ -1,4 +1,4 @@
-﻿import os
+import os
 import requests
 from datetime import datetime
 from .engines.smc_ict import generate_signal

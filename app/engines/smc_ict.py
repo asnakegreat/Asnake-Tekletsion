@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 from datetime import datetime
 
 def generate_signal(snapshot: dict) -> dict:

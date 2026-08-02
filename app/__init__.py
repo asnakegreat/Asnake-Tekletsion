@@ -1,1 +1,1 @@
-﻿__init__ = 'app package'
+__init__ = 'app package'
