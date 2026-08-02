@@ -22,15 +22,15 @@ jobs:
         run: pytest -q
       - name: Validate signal.json against schema
         run: |
-          python - <<'PY'
-import json, sys
-from jsonschema import validate
-s = json.load(open('signal.schema.json'))
-d = json.load(open('signal.json'))
-try:
-    validate(instance=d, schema=s)
-    print('Schema validation OK')
-except Exception as e:
-    print('Schema validation failed:', e)
-    sys.exit(1)
-PY
+          python -c "
+          import json, sys
+          from jsonschema import validate
+          s = json.load(open('signal.schema.json'))
+          d = json.load(open('signal.json'))
+          try:
+              validate(instance=d, schema=s)
+              print('Schema validation OK')
+          except Exception as e:
+              print('Schema validation failed:', e)
+              sys.exit(1)
+          "
