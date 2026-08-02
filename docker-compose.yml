@@ -1,0 +1,36 @@
+﻿version: "3.8"
+services:
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - API_BASE_URL=http://api:8000
+      - ACCOUNT_BALANCE=10000
+      - RISK_PERCENT=0.01
+    depends_on:
+      - redis
+      - db
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=signals
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "5432:5432"
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+  worker:
+    build: .
+    command: celery -A app.celery_app.celery worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+      - redis

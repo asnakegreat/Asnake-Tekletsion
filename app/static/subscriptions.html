@@ -1,0 +1,22 @@
+﻿<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Signal Scanner - Subscriptions (Demo)</title></head>
+  <body>
+    <h1>Subscriptions (Demo)</h1>
+    <form id=frm>
+      <label>User ID: <input id=user value="demo"/></label><br/>
+      <label>Channel: <select id=channel><option>telegram</option><option>webhook</option></select></label><br/>
+      <label>Filters (JSON): <input id=filters value='{"pair":"EURUSD","min_confidence":0.6}' size=60/></label><br/>
+      <button type=button onclick='subscribe()'>Subscribe</button>
+    </form>
+    <pre id=out></pre>
+    <script>
+      async function subscribe(){
+        const body = {user_id:document.getElementById('user').value||'demo', channel:document.getElementById('channel').value, filters: JSON.parse(document.getElementById('filters').value)};
+        const r = await fetch('/api/subscribe', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+        const j = await r.json();
+        document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+      }
+    </script>
+  </body>
+</html>
