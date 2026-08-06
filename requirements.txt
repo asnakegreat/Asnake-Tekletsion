@@ -1,6 +1,8 @@
+﻿celery
+redis
+requests
+jsonschema
 fastapi
 uvicorn
-jsonschema
-requests
 pytest
 pydantic
