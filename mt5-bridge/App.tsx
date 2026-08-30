@@ -39,6 +39,8 @@
  *   [data-test="regime-cell-<SYM>-<TF>"]      v14 regime chip (v7)
  *   [data-test="conf-cell-<SYM>-<TF>"]        v12 confluence cell (v7)
  *   [data-test="oracle-cell-<SYM>-<TF>"]      v15 oracle score cell (v7)
+ *   [data-test="news-cell-<SYM>-<TF>"]        v16 news-sentiment bias (paict_news.py)
+ *   [data-test="vision-cell-<SYM>-<TF>"]      v16 chart-vision pattern/wick (paict_vision.py)
  *   [data-test="conn-status"]                 LIVE·WS / LIVE / AWAITING / OFFLINE
  *   [data-test="ws-status"]                   WebSocket feed state (v7)
  *   [data-test="monitor-matrix|heatmap|montecarlo|journal|oracle"]  view tabs
@@ -143,6 +145,12 @@ type Row = {
   leadFlash?: boolean;
   oracleScore?: number;
   notes?: NoteRow[];
+  // v16/v17 local-sensor fields (paict_news.py / paict_vision.py, additive)
+  newsBiasDir?: number;
+  newsBiasScore?: number;
+  newsHeadline?: string;
+  visionPatterns?: { name: string; conf: number; barsAgo: number; dir: number }[];
+  visionWicks?: { barsAgo: number; side: string; strength: number }[];
 };
 
 type ViewKey = "pa" | "ict" | "zenith";
@@ -717,6 +725,50 @@ export default function Mt5BridgeDashboard() {
     );
   };
 
+  /** v16 NEWS cell — paict_news.py's freshest bias for this slot. */
+  const newsCell = (r: Row) => {
+    if (typeof r.newsBiasDir !== "number") return <span style={{ color: COLORS.muted }}>—</span>;
+    const up = r.newsBiasDir > 0;
+    const nc = r.newsBiasDir === 0 ? COLORS.muted : up ? COLORS.tp : COLORS.sl;
+    return (
+      <span
+        data-test={`news-cell-${r.symbol}-${r.timeframe}`}
+        style={{ display: "inline-flex", gap: 6, alignItems: "baseline", whiteSpace: "nowrap" }}
+        title={r.newsHeadline ?? ""}
+      >
+        <b style={{ color: nc, fontSize: 13 }}>{up ? "▲" : r.newsBiasDir < 0 ? "▼" : "•"}</b>
+        <span style={{ color: COLORS.muted, fontSize: 11, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" }}>
+          {r.newsHeadline ?? `bias ${r.newsBiasScore ?? 0}`}
+        </span>
+      </span>
+    );
+  };
+
+  /** v16 VISION cell — paict_vision.py's top pattern + any wick-rejects. */
+  const visionCell = (r: Row) => {
+    const pats = r.visionPatterns ?? [];
+    const wicks = r.visionWicks ?? [];
+    if (pats.length === 0 && wicks.length === 0) return <span style={{ color: COLORS.muted }}>—</span>;
+    const top = pats[0];
+    return (
+      <span
+        data-test={`vision-cell-${r.symbol}-${r.timeframe}`}
+        style={{ display: "inline-flex", gap: 6, alignItems: "baseline", whiteSpace: "nowrap" }}
+      >
+        {top && (
+          <span style={{ color: COLORS.violet, fontWeight: 700, fontSize: 11 }}>
+            {top.name} {top.conf}%
+          </span>
+        )}
+        {wicks.length > 0 && (
+          <span style={{ color: COLORS.amber, fontSize: 10 }}>
+            {wicks[0].side.toUpperCase()} WICK {wicks[0].strength}
+          </span>
+        )}
+      </span>
+    );
+  };
+
   /** v6/v7 WARNINGS cell — all engines' alerts in one place. */
   const warnCell = (r: Row) => {
     const parts: React.ReactElement[] = [];
@@ -744,7 +796,7 @@ export default function Mt5BridgeDashboard() {
   const viewCols: Record<ViewKey, string[]> = {
     pa: ["ALERTS", "STATUS", "AGE"],
     ict: ["DISP", "MASTER", "VERDICT", "CONF", "ALERTS", "AGE"],
-    zenith: ["MASTER", "VERDICT", "REGIME", "CONF", "ORACLE", "ALERTS", "STATUS", "AGE"],
+    zenith: ["MASTER", "VERDICT", "REGIME", "CONF", "ORACLE", "NEWS", "VISION", "ALERTS", "STATUS", "AGE"],
   };
   const cols = viewCols[view];
   const colCount = 7 + cols.length + (cols.includes("MASTER") ? 1 : 0);
@@ -760,6 +812,10 @@ export default function Mt5BridgeDashboard() {
         return confCell(r);
       case "ORACLE":
         return oracleCell(r);
+      case "NEWS":
+        return newsCell(r);
+      case "VISION":
+        return visionCell(r);
       case "ALERTS":
         return (
           <span data-test={`copilot-cell-${r.symbol}-${r.timeframe}`}>
@@ -1378,7 +1434,7 @@ export default function Mt5BridgeDashboard() {
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
                 <thead>
                   <tr>
-                    {["PAIR", "ORACLE", "MASTER", "CONFLUENCE", "REGIME", "H/K"].map((h) => (
+                    {["PAIR", "ORACLE", "MASTER", "CONFLUENCE", "REGIME", "H/K", "NEWS", "VISION"].map((h) => (
                       <th key={h} style={th}>
                         {h}
                       </th>
@@ -1388,7 +1444,7 @@ export default function Mt5BridgeDashboard() {
                 <tbody>
                   {visible.length === 0 && (
                     <tr>
-                      <td style={{ ...td, color: COLORS.muted }} colSpan={6}>
+                      <td style={{ ...td, color: COLORS.muted }} colSpan={8}>
                         oracle idles until the EA pushes plans…
                       </td>
                     </tr>
@@ -1414,6 +1470,8 @@ export default function Mt5BridgeDashboard() {
                             ? `H ${r.hurst.toFixed(2)} / KER ${Number(r.ker ?? 0).toFixed(2)}`
                             : "—"}
                         </td>
+                        <td style={td}>{newsCell(r)}</td>
+                        <td style={td}>{visionCell(r)}</td>
                       </tr>
                     ))}
                 </tbody>

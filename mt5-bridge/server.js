@@ -59,10 +59,24 @@
  *    GET    /v1/commands   -> { ok: true, slots: { slot: [cmd, ...] } }
  *    DELETE /v1/commands   -> { ok: true, cleared: true }
  *    GET    /v1/snapshot   -> the EA mailbox JSON verbatim (503 when unset/stale)
+ *    POST   /v1/news       -> { slot, event: {id, biasDir, score, headline, tags, at} }
+ *                             (paict_news.py). Deduped by event.id; the freshest
+ *                             event per slot is also mirrored onto that slot's
+ *                             matrix row (newsBiasDir/newsBiasScore/newsHeadline)
+ *                             so existing matrix consumers see it for free.
+ *    GET    /v1/news[?slot=] -> [ event, ... ] newest-first for one slot, or
+ *                             { slot: [event, ...], ... } for all slots
+ *    POST   /v1/vision     -> { slot, source, patterns:[...], wicks:[...] }
+ *                             (paict_vision.py). Replaces the slot's prior
+ *                             reading and is mirrored onto that slot's matrix
+ *                             row (visionPatterns/visionWicks).
+ *    GET    /v1/vision[?slot=] -> { patterns, wicks, source, receivedAt } for
+ *                             one slot, or { slot: {...}, ... } for all slots
  *    GET    /v1/health     -> uptime + push stats + ws clients + mailbox state
  *    WS     /              -> RFC 6455 upgrade, broadcast feed (see above)
  *
- * The EA only POSTs /v1/matrix and GETs /v1/poll; the dashboard (any
+ * The EA POSTs /v1/matrix and GETs /v1/poll; paict_news.py/paict_vision.py
+ * POST /v1/news and /v1/vision from the same machine; the dashboard (any
  * number of windows) consumes the REST + the WebSocket feed.
  */
 
@@ -251,6 +265,17 @@ const SNAPSHOT_FILE = process.env.PAICT_SNAPSHOT_FILE || "";
 
 const slotKey = (v) => String(v || "").trim().toUpperCase();
 
+// Matrix rows are keyed by the RAW "symbol|timeframe" (case preserved, e.g.
+// "XAUUSDz|M15") so the dashboard can display the broker's exact symbol
+// spelling, while /v1/commands, /v1/news and /v1/vision all key by the
+// uppercased slotKey(). Merging a news/vision reading onto its matrix row
+// needs a case-insensitive match against that raw key — matrix.has(slot)
+// would silently miss any symbol carrying a broker suffix like "z" or "m".
+const findMatrixKey = (slot) => {
+  for (const k of matrix.keys()) if (slotKey(k) === slot) return k;
+  return null;
+};
+
 const rowsNewestFirst = () =>
   [...matrix.values()].sort((a, z) =>
     String(z.receivedAt).localeCompare(String(a.receivedAt)),
@@ -380,6 +405,103 @@ app.get("/v1/snapshot", (req, res) => {
   });
 });
 
+// ---- news sentiment (paict_news.py) ------------------------------------
+
+const MAX_NEWS_PER_SLOT = 20;
+const news = new Map(); // "XAUUSDz|M15" -> [ {id, biasDir, score, headline, tags, at, receivedAt}, ... ] newest-first
+
+app.post("/v1/news", (req, res) => {
+  const b = req.body || {};
+  const slot = slotKey(b.slot);
+  const ev = b.event || {};
+  if (!slot) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'missing slot — use "SYMBOL|TIMEFRAME"' });
+  }
+  if (typeof ev.id !== "string" || ev.id.length === 0) {
+    return res.status(400).json({ ok: false, error: "missing event.id" });
+  }
+  if (!news.has(slot)) news.set(slot, []);
+  const q = news.get(slot);
+  if (q.some((e) => e.id === ev.id)) {
+    // paict_news.py retries a line until the POST succeeds, so a re-delivery
+    // of an already-stored id is expected, not an error — dedupe silently.
+    return res.json({ ok: true, slot, deduped: true });
+  }
+  const stored = { ...ev, receivedAt: new Date().toISOString() };
+  q.unshift(stored);
+  if (q.length > MAX_NEWS_PER_SLOT) q.length = MAX_NEWS_PER_SLOT;
+  // Mirror the freshest reading onto the matrix row (if the slot already has
+  // one) so the dashboard's existing per-row rendering picks it up with no
+  // separate fetch — same pattern as every other oracle-engine field.
+  const mk = findMatrixKey(slot);
+  if (mk) {
+    matrix.set(mk, {
+      ...matrix.get(mk),
+      newsBiasDir: stored.biasDir,
+      newsBiasScore: stored.score,
+      newsHeadline: stored.headline,
+    });
+  }
+  wsBroadcastMatrix();
+  wsBroadcast(JSON.stringify({ type: "news", slot, event: stored }));
+  res.json({ ok: true, slot, stored: true });
+});
+
+app.get("/v1/news", (req, res) => {
+  if (req.query.slot) return res.json(news.get(slotKey(req.query.slot)) || []);
+  const out = {};
+  for (const [k, v] of news) out[k] = v;
+  res.json(out);
+});
+
+// ---- chart vision (paict_vision.py) ------------------------------------
+
+const vision = new Map(); // "XAUUSDz|M15" -> { source, patterns, wicks, receivedAt }
+
+app.post("/v1/vision", (req, res) => {
+  const b = req.body || {};
+  const slot = slotKey(b.slot);
+  if (!slot) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'missing slot — use "SYMBOL|TIMEFRAME"' });
+  }
+  const stored = {
+    source: typeof b.source === "string" ? b.source : "paict-vision",
+    patterns: Array.isArray(b.patterns) ? b.patterns : [],
+    wicks: Array.isArray(b.wicks) ? b.wicks : [],
+    receivedAt: new Date().toISOString(),
+  };
+  vision.set(slot, stored);
+  const mk = findMatrixKey(slot);
+  if (mk) {
+    matrix.set(mk, {
+      ...matrix.get(mk),
+      visionPatterns: stored.patterns,
+      visionWicks: stored.wicks,
+    });
+  }
+  wsBroadcastMatrix();
+  wsBroadcast(JSON.stringify({ type: "vision", slot, ...stored }));
+  res.json({
+    ok: true,
+    slot,
+    patterns: stored.patterns.length,
+    wicks: stored.wicks.length,
+  });
+});
+
+app.get("/v1/vision", (req, res) => {
+  if (req.query.slot) {
+    return res.json(vision.get(slotKey(req.query.slot)) || { patterns: [], wicks: [] });
+  }
+  const out = {};
+  for (const [k, v] of vision) out[k] = v;
+  res.json(out);
+});
+
 // ------------------------------------------------------------------------
 
 app.get("/v1/health", (req, res) =>
@@ -387,6 +509,8 @@ app.get("/v1/health", (req, res) =>
     ok: true,
     ...stats,
     pairs: matrix.size,
+    newsSlots: news.size,
+    visionSlots: vision.size,
     wsClients: WS_CLIENTS.size,
     pendingCommands: [...commands.values()].reduce((n, q) => n + q.length, 0),
     mailbox: SNAPSHOT_FILE ? "configured" : "off",
