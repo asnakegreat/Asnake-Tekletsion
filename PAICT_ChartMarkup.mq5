@@ -1075,12 +1075,16 @@ struct SZenSnap
   };
 SZenSnap g_zen;
 
-// v11.00 price-in-zone alerts: last "kind|planSignature" alerted + when —
-// throttled per KIND *and* per PLAN so watching several pairs does not
-// spam mobile push, and a freshly formed plan is never suppressed by the
-// cooldown a DIFFERENT, older plan left behind (v15.01 fix).
-string   g_lastAlertSig   = "";
-datetime g_lastAlertTime  = 0;
+// v11.00 price-in-zone alerts, throttled per KIND *and* per PLAN so
+// watching several pairs does not spam mobile push, and a freshly formed
+// plan is never suppressed by a cooldown a DIFFERENT, older plan left
+// behind. v15.03: ENTRY/STOP/TARGET each get their OWN remembered
+// (planKey, time) slot — a single shared slot (v15.01) meant firing STOP
+// then ENTRY seconds later overwrote ENTRY's own cooldown clock, so
+// switching kinds could bypass a kind's cooldown entirely.
+string   g_lastAlertKind[3]    = {"ENTRY", "STOP", "TARGET"};
+string   g_lastAlertPlanKey[3] = {"", "", ""};
+datetime g_lastAlertTimeAt[3]  = {0, 0, 0};
 
 /* ------------------------------------------------------------------ */
 /* v13.00 performance analytics state                                  */
@@ -5057,13 +5061,22 @@ void DrawPlanLine(const long chart_id, const MqlRates &rates[], const ENUM_TIMEF
 /* ================================================================== */
 void FireAlert(const string kind, const string planKey, const string text)
   {
-   const string   sig = kind + "|" + planKey;
+   int slot = -1;
+   for(int i = 0; i < 3; i++)
+      if(g_lastAlertKind[i] == kind)
+        {
+         slot = i;
+         break;
+        }
+   if(slot < 0)
+      return;                                  // unknown kind — never configured, ignore
+
    const datetime now = TimeCurrent();
-   if(sig == g_lastAlertSig &&
-      now - g_lastAlertTime < MathMax(1, InpAlertCooldownMin) * 60)
+   if(g_lastAlertPlanKey[slot] == planKey &&
+      now - g_lastAlertTimeAt[slot] < MathMax(1, InpAlertCooldownMin) * 60)
       return;                                  // same kind, same plan, still cooling down
-   g_lastAlertSig  = sig;
-   g_lastAlertTime = now;
+   g_lastAlertPlanKey[slot] = planKey;
+   g_lastAlertTimeAt[slot]  = now;
 
    Alert(text);
    Print("PAICT alert: ", text);
