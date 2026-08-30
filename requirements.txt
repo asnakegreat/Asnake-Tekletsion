@@ -1,7 +1,7 @@
 ﻿celery
 redis
 requests
-jsonschema
+jsonschema>=4.0.0
 fastapi
 uvicorn
 pytest
