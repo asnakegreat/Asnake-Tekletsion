@@ -991,6 +991,7 @@ datetime   g_tunerScan     = 0;      // tuner file last scan (throttle)
 string     g_tunerKeys[];            // whitelisted tuner suggestion keys ...
 string     g_tunerVals[];            // ... and their values (display-only)
 bool       g_domWarned     = false;  // broker without Depth of Market — warn once
+string     g_domSubs[];              // symbols currently subscribed via MarketBookAdd
 
 /* ------------------------------------------------------------------ */
 /* v6.00-v9.00 metric bus — every analyzer stashes its latest numbers  */
@@ -1071,9 +1072,11 @@ struct SZenSnap
   };
 SZenSnap g_zen;
 
-// v11.00 price-in-zone alerts: last kind alerted + when, per attach plan —
-// throttled so watching several pairs does not spam mobile push.
-string   g_lastAlertKind  = "";
+// v11.00 price-in-zone alerts: last "kind|planSignature" alerted + when —
+// throttled per KIND *and* per PLAN so watching several pairs does not
+// spam mobile push, and a freshly formed plan is never suppressed by the
+// cooldown a DIFFERENT, older plan left behind (v15.01 fix).
+string   g_lastAlertSig   = "";
 datetime g_lastAlertTime  = 0;
 
 /* ------------------------------------------------------------------ */
@@ -1227,17 +1230,13 @@ int OnInit()
    g_claimed = true;
 
    EventSetTimer(g_refreshS);
-   // v7.00: subscribe to Depth of Market for the attach symbol (opt-in).
+   // v7.00 / v15.01: subscribe to Depth of Market for the attach symbol
+   // up front (opt-in); every OTHER covered symbol gets its own
+   // subscription lazily via EnsureDOMSubscription() the first time
+   // DrawDOMStrip() renders it — a single MarketBookAdd(_Symbol) here left
+   // every other covered chart's ladder strip permanently empty.
    if(InpDrawDOM)
-     {
-      ResetLastError();
-      if(!MarketBookAdd(_Symbol))
-        {
-         g_domWarned = true;
-         Print("PAICT DOM: MarketBookAdd failed (error ", GetLastError(),
-               ") — the DOM ladder strip stays off for this broker/symbol.");
-        }
-     }
+      EnsureDOMSubscription(_Symbol);
    // Startup journal: version macro + attach-chart digits verified here
    // (per-symbol digits are verified again per chart inside the JSON writer).
    Print("PAICT_ChartMarkup v", PAICT_VERSION, " started on ", _Symbol,
@@ -1284,8 +1283,11 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
-   if(InpDrawDOM)
-      MarketBookRelease(_Symbol);   // v7.00: drop the DOM subscription
+   // v15.01: release every symbol subscribed via EnsureDOMSubscription(),
+   // not just the attach symbol.
+   for(int i = 0; i < ArraySize(g_domSubs); i++)
+      MarketBookRelease(g_domSubs[i]);
+   ArrayFree(g_domSubs);
 
    // A second attach that lost the single-instance lock (OnInit returned
    // INIT_FAILED) still runs OnDeinit. Chart objects are terminal-wide, not
@@ -1764,6 +1766,13 @@ void ScanTradeStats()
       balances[i - start] = allBal[i];
      }
 
+   // v15.01: a manual close detected between closed bars would otherwise
+   // sit in these globals unseen — the HUD, sparkline and bridge payload
+   // only refresh on the next closed bar's redraw. Force one now, exactly
+   // like ScanTunerFile does when its own suggestions change.
+   if(trades != g_statsTrades)
+      ForceFullRedraw();
+
    g_statsTrades = trades;
    g_statsWinPct = (trades > 0) ? 100.0 * wins / trades : 0.0;
    g_statsExpR   = (rCount > 0) ? sumR / rCount : 0.0;
@@ -2237,6 +2246,9 @@ double ComputeRiskLots(const string symbol, const double entry, const double sto
    const double minV = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    if(lots < minV)
       return(0.0);   // no compliant size exists — rounding UP to minV would risk more than riskPct
+   const double maxV = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   if(maxV > 0.0 && lots > maxV)
+      lots = maxV;   // a tight stop / large balance can floor-round above the broker's ceiling
    return(lots);
   }
 
@@ -3005,6 +3017,14 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       DrawProbabilityCone(chart_id, rates, st.tf, st.lastClosed, st.closeRef);
    if(InpCVD)
       DrawCVD(chart_id, rates, st.lastClosed, st);
+   else
+     {
+      // v15.01: CVD off — clear the shared reading so ComputeMasterScore()
+      // and the bridge payload don't keep scoring a stale prior signal
+      // (globals survive across renders and OnInit reparameterization).
+      g_cvdDir = 0;
+      g_cvdDiv = false;
+     }
    if(InpSweepTags)
       TagSweeps(chart_id, rates, st);
    if(InpAbsorption)
@@ -3015,7 +3035,11 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       DrawICTPatterns(chart_id, rates, st);
    if(InpDrawDOM)
       DrawDOMStrip(chart_id, st.symbol, st.tf);
-   if(InpSandbox && g_ov.sandbox)
+   // v15.01: g_sb is one shared instance, and CHARTEVENT_OBJECT_DRAG only
+   // ever fires for the EA's own (attach) chart anyway — rendering it on
+   // every covered chart let each one's plan reanchor and clobber a drag
+   // just made on the attach chart.
+   if(InpSandbox && g_ov.sandbox && chart_id == ChartID())
       RenderSandbox(chart_id, rates, st.lastClosed, st.tf, st);
    if(InpEquitySpark && chart_id == ChartID())
       DrawEquitySpark(chart_id, rates, st.lastClosed, st.tf, st.atr, st.closeRef);
@@ -4919,13 +4943,14 @@ void DrawPlanLine(const long chart_id, const MqlRates &rates[], const ENUM_TIMEF
 /* (ENTRY / STOP / TARGET) so a plan sitting exactly on a level does   */
 /* not spam a push every OnTimer tick.                                 */
 /* ================================================================== */
-void FireAlert(const string kind, const string text)
+void FireAlert(const string kind, const string planKey, const string text)
   {
+   const string   sig = kind + "|" + planKey;
    const datetime now = TimeCurrent();
-   if(kind == g_lastAlertKind &&
+   if(sig == g_lastAlertSig &&
       now - g_lastAlertTime < MathMax(1, InpAlertCooldownMin) * 60)
-      return;                                  // same kind, still cooling down
-   g_lastAlertKind = kind;
+      return;                                  // same kind, same plan, still cooling down
+   g_lastAlertSig  = sig;
    g_lastAlertTime = now;
 
    Alert(text);
@@ -4950,16 +4975,22 @@ void CheckPriceAlerts()
    const double tol = MathMax(atr * ALERT_TOL_ATR, _Point);
    const int    dg  = _Digits;
    const bool   isLong = (g_plan.target > g_plan.entry);
+   // Identifies THIS plan instance so a freshly formed plan's first ENTRY
+   // alert is never suppressed by a cooldown a different, older plan left
+   // behind, and switching kinds on the same plan still throttles per kind.
+   const string planKey = DoubleToString(g_plan.entry, dg) + "/" +
+                          DoubleToString(g_plan.stop, dg) + "/" +
+                          DoubleToString(g_plan.target, dg);
 
    if(MathAbs(bid - g_plan.entry) <= tol)
-      FireAlert("ENTRY", "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
+      FireAlert("ENTRY", planKey, "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
                 ": price in ENTRY zone " + DoubleToString(g_plan.entry, dg) +
                 " (" + (isLong ? "long" : "short") + ")");
    else if((isLong && bid <= g_plan.stop) || (!isLong && bid >= g_plan.stop))
-      FireAlert("STOP", "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
+      FireAlert("STOP", planKey, "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
                 ": STOP touched at " + DoubleToString(g_plan.stop, dg));
    else if((isLong && bid >= g_plan.target) || (!isLong && bid <= g_plan.target))
-      FireAlert("TARGET", "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
+      FireAlert("TARGET", planKey, "PAICT " + _Symbol + " " + BridgeTimeframeLabel() +
                 ": TARGET touched at " + DoubleToString(g_plan.target, dg));
   }
 
@@ -5229,11 +5260,40 @@ void MonteCarloEvaluate(const double entry, const double stop, const double targ
   }
 
 //+------------------------------------------------------------------+
+//| v15.01: lazily subscribe ONE symbol to Depth of Market. A single    |
+//| MarketBookAdd(_Symbol) in OnInit only ever covered the attach       |
+//| chart — every other covered symbol's ladder strip stayed empty.     |
+//+------------------------------------------------------------------+
+bool EnsureDOMSubscription(const string sym)
+  {
+   for(int i = 0; i < ArraySize(g_domSubs); i++)
+      if(g_domSubs[i] == sym)
+         return(true);
+   ResetLastError();
+   if(!MarketBookAdd(sym))
+     {
+      if(!g_domWarned)
+        {
+         g_domWarned = true;
+         Print("PAICT DOM: MarketBookAdd failed for ", sym, " (error ", GetLastError(),
+               ") — its ladder strip stays off for this broker/symbol.");
+        }
+      return(false);
+     }
+   const int at = ArraySize(g_domSubs);
+   ArrayResize(g_domSubs, at + 1, ARRAY_RESERVE_CHUNK);
+   g_domSubs[at] = sym;
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
 //| Depth of Market ladder: bid/ask volume bars reaching back from the |
 //| forming bar. Needs a broker that serves MarketBookGet.             |
 //+------------------------------------------------------------------+
 void DrawDOMStrip(const long chart_id, const string sym, const ENUM_TIMEFRAMES tf)
   {
+   if(!EnsureDOMSubscription(sym))
+      return;
    MqlBookInfo book[];
    if(!MarketBookGet(sym, book) || ArraySize(book) == 0)
      {
@@ -5312,7 +5372,11 @@ void DrawCVD(const long chart_id, const MqlRates &rates[], const int lastClosed,
   {
    const int len = (int)MathMax(24, MathMin(300, InpCVDLength));
    if(lastClosed < len + 2 || st.atr <= 0.0)
+     {
+      g_cvdDir = 0;      // not enough history for a real reading — don't
+      g_cvdDiv = false;  // let a stale prior signal keep scoring/pushing
       return;
+     }
    const int i0 = lastClosed - len;
    double cvd[];
    ArrayResize(cvd, len + 1, ARRAY_RESERVE_CHUNK);
@@ -6006,12 +6070,27 @@ void ComputeSessionCountdown(string &label)
    string   bestLabel = "";
    for(int i = 0; i < 3; i++)
      {
-      datetime s = dayStart + (long)MathMax(0, starts[i]) * 3600;
-      datetime e = s + (long)lens[i] * 3600;
-      while(e <= now)          // roll forward until this session's window is ahead of now
+      // A session whose window crosses midnight (e.g. start 23, length 3)
+      // opened YESTERDAY and may still be active right now — check that
+      // window first, since the today-anchored one below would otherwise
+      // report it as "opens in 22h" instead of "closes in 1h".
+      const datetime sPrev = dayStart - 86400 + (long)MathMax(0, starts[i]) * 3600;
+      const datetime ePrev = sPrev + (long)lens[i] * 3600;
+      datetime s, e;
+      if(now >= sPrev && now < ePrev)
         {
-         s += 86400;
-         e += 86400;
+         s = sPrev;
+         e = ePrev;
+        }
+      else
+        {
+         s = dayStart + (long)MathMax(0, starts[i]) * 3600;
+         e = s + (long)lens[i] * 3600;
+         while(e <= now)          // roll forward until this session's window is ahead of now
+           {
+            s += 86400;
+            e += 86400;
+           }
         }
       datetime candTime; string candLabel;
       if(now < s)
@@ -6367,30 +6446,28 @@ void PushMatrixToBridge()
             "' under Tools -> Options -> Expert Advisors -> Allow WebRequest.");
       return;
      }
-   // MQL5 gotcha: WebRequest returns the number of BODY BYTES received,
-   // NOT the HTTP status code. The real status lives in the first line
-   // of resultHeaders, e.g. "HTTP/1.1 200 OK". Parse it; when it is
-   // missing the responder is not behaving like normal HTTP — the
-   // forensics line below dumps enough raw material to identify it.
-   int    status     = 0;
+   // v15.01 correction: the 7-argument WebRequest() (method, url, headers,
+   // timeout, data[], result[], result_headers) returns the actual HTTP
+   // status code, not a body-byte count — the v2.03 "res is bytes, parse
+   // resultHeaders instead" theory was wrong, and it made ok2xx depend on
+   // resultHeaders starting with "HTTP/", which is not guaranteed even on
+   // a perfectly healthy 200 response, silently skipping PollRemoteCommands
+   // on every push. `res` is now the source of truth; resultHeaders is
+   // parsed only for the human-readable status line in the log/forensics.
+   const bool ok2xx = (res >= 200 && res <= 299);
    string statusLine = "";
    if(StringFind(resultHeaders, "HTTP/") == 0)
      {
-      int sp = StringFind(resultHeaders, "\r\n");
-      statusLine = (sp >= 0) ? StringSubstr(resultHeaders, 0, sp)
-                             : resultHeaders;
-      int code = StringFind(statusLine, " ") + 1;
-      status   = (int)StringToInteger(StringSubstr(statusLine, code, 3));
+      const int sp = StringFind(resultHeaders, "\r\n");
+      statusLine = (sp >= 0) ? StringSubstr(resultHeaders, 0, sp) : resultHeaders;
      }
-   bool ok2xx = (status >= 200 && status <= 299);
+   else
+      statusLine = "HTTP " + IntegerToString(res);
    if(ok2xx && InpRemoteControl)
       PollRemoteCommands();   // v4.00 two-way: collect + apply bridge commands
    if(InpBridgeVerbose || !ok2xx)
       Print("Matrix Bridge: pushed ", ArraySize(post), " bytes, reply ",
-            res, " bytes <- ",
-            (statusLine == "" ? "no status line (hdrLen=" +
-                               IntegerToString(StringLen(resultHeaders)) + ")"
-                              : statusLine),
+            ArraySize(result), " bytes <- ", statusLine,
             " (", _Symbol, " ", BridgeTimeframeLabel(), ")");
    if(!ok2xx)   // non-2xx: show WHAT the server actually said
      {
