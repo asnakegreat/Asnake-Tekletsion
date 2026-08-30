@@ -6550,11 +6550,16 @@ bool ComputeHarmonic(const int hiIdx[], const double hiVal[], const int nHi,
    bool bullish = (X < A) && (B < A) && (C > B) && (D < C);   // D makes the lowest low = bullish reversal (long PRZ)
    bool bearish = (X > A) && (B > A) && (C < B) && (D > C);
 
-   // canonical AB=XA retracement bands per pattern
-   string patNames[4] = {"GARTLEY", "BAT", "BUTTERFLY", "CRAB"};
-   double patAb[4]     = {0.618, 0.50, 0.786, 0.618};
+   // canonical AB=XA retracement bands per pattern. Gartley and Crab both
+   // target AB=0.618 of XA — they are told apart by the D leg, not AB: a
+   // Gartley's D stays a RETRACEMENT within the XA range, while a Crab's D
+   // OVERSHOOTS beyond X (its defining 1.618 XA extension). Checking AB
+   // alone previously let GARTLEY (checked first) win every 0.618 match,
+   // making CRAB unreachable even on genuine Crab geometry.
+   string patNames[3] = {"GARTLEY", "BAT", "BUTTERFLY"};
+   double patAb[3]     = {0.618, 0.50, 0.786};
 
-   for(int i = 0; i < 4; i++)
+   for(int i = 0; i < 3; i++)
      {
       if(!RatioNear(abXa, patAb[i], tolPct))
          continue;
@@ -6563,6 +6568,11 @@ bool ComputeHarmonic(const int hiIdx[], const double hiVal[], const int nHi,
       if(bullish || bearish)
         {
          pattern = patNames[i];
+         if(i == 0)                     // AB=0.618: disambiguate Gartley vs Crab
+           {
+            const bool overshoot = bullish ? (D < X) : (D > X);
+            pattern = overshoot ? "CRAB" : "GARTLEY";
+           }
          dir     = bullish ? 1 : -1;
          const double przCenter = D;
          const double band      = legCD * (tolPct / 100.0) * 2.0;
