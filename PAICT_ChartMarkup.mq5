@@ -108,8 +108,58 @@
 //+------------------------------------------------------------------+
 #property copyright "Chart Markup Key"
 #property link      ""
-#property version   "15.00"
+#property version   "20.00"
 #property description "Draws Price Action + ICT/SMC markup (thin lines / thin outline boxes) on every open chart."
+// v20.00 — THE ORACLE (roadmap V20.00 — fuse every independent read this EA
+//         produces into one number, and let the trader mark up the chart
+//         with their own read alongside it):
+//         1. Oracle Score: master 45% + confluence 25% + flow sentiment 15%
+//            + regime alignment 15% (0-100). >= InpOracleGoAt (default 85)
+//            flashes "PERFECT SETUP" on the HUD. Toggle: InpOracleScore.
+//         2. On-chart journal: double-click any chart to drop a numbered
+//            note pinned at that exact price/time (OBJ_TEXT + OBJ_EDIT
+//            popup for the note body), persisted to
+//            MQL5\Files\PAICT_Notes.csv and pushed as notes[] in the
+//            bridge payload so the dashboard's Journal monitor can render
+//            it. Toggle: InpJournal.
+// v19.00 — MACRO CROSSCURRENTS (roadmap V19.00 — what is the wider market
+//         doing while this chart's setup builds):
+//         1. Yield curve monitor: reads InpYieldShort / InpYieldLong bond
+//            CFD symbols, computes their spread and flags an inversion —
+//            "2s10s -0.42 INVERTED". Skips silently when the symbols
+//            aren't available from the broker. Toggle: InpYieldCurve.
+//         2. Intermarket lead/lag: watches InpLeadSymbol for a move past
+//            InpLeadAtrMult x its own ATR and flags leadFlash + direction
+//            so a correlated chart can react early. Toggle: InpLeadLag.
+// v18.00 — PATTERN GEOMETRY (roadmap V18.00 — the two classic manual-chartist
+//         reads, done heuristically off confirmed swings):
+//         1. Harmonic XABCD scan (Gartley / Bat / Butterfly / Crab) over the
+//            last five confirmed swing points, tolerance-banded against each
+//            pattern's canonical Fibonacci ratios; a match draws the PRZ
+//            (potential reversal zone) box and reports harmonic/harmDir.
+//            Toggle: InpHarmonics.
+//         2. Simplified Elliott Wave count over the same swing series
+//            (impulse 1-5 / corrective ABC heuristic), reported as
+//            elliott/ewDir. Toggle: InpElliottWave.
+// v17.00 — CONFLUENCE FUSION (roadmap V17.00 — stack every independent
+//         signal this EA already computes into one agreement score):
+//         1. Confluence Fusion: counts how many of the existing independent
+//            reads (OB/FVG bias, structure break, liquidity sweep, OTE
+//            zone, session killzone, correlation alignment, CVD, Monte
+//            Carlo TP%, volatility regime) agree with the plan's direction,
+//            turns the count into confluence (0-100) + confCount +
+//            confTags ("OB+FVG+CVD"). Toggle: InpConfluence.
+// v16.00 — REGIME & VOLATILITY READ (roadmap V16.00 — classify what kind of
+//         market this is before trusting any directional plan):
+//         1. Market regime: Hurst exponent (R/S analysis) + Kaufman
+//            Efficiency Ratio over InpRegimeBars bars classify the chart as
+//            TRENDING / RANGING / TRANSITION, shown on the HUD and folded
+//            into Master Score (-15 when an ICT trend-continuation plan
+//            fights a RANGING regime, +5 when it rides a TRENDING one).
+//            Toggle: InpRegime.
+//         2. Volatility contraction (VCV): Bollinger-inside-Keltner squeeze
+//            detection with a "cone" flag when the squeeze is actively
+//            narrowing bar over bar. Toggle: InpVcv.
 // v15.00 — THE COCKPIT SUMMARY (roadmap V15.00 — a top-down view across
 //         every covered chart, and a sense of session time remaining):
 //         1. Cross-chart leaderboard: as each covered chart renders, its
@@ -611,7 +661,7 @@
 #define OBJ_PREFIX    "PAICT_"
 #define IND_SHORTNAME "PAICT DualMA"
 #define GV_OWNER      "PAICT_ChartMarkup_Owner"
-#define PAICT_VERSION "15.00"  // single source of truth for journal output
+#define PAICT_VERSION "20.00"  // single source of truth for journal output
 
 /* ------------------------------------------------------------------ */
 /* v2.07 tuning constants — every formerly-hardcoded heuristic, named. */
@@ -704,6 +754,9 @@
 #define MASTER_FONT           15     // Master Score verdict font size
 #define MASTER_HALF_W         62     // Master Score label half-width estimate (px)
 #define MASTER_Y              4      // Master Score label y inset (px)
+#define ORACLE_FONT           11     // Oracle Score label font size
+#define ORACLE_HALF_W         70     // Oracle Score label half-width estimate (px)
+#define ORACLE_Y              (MASTER_Y + 22) // below the Master Score verdict
 #define ZEN_HUD_Y_OFF         84     // zenith HUD block starts below the v4 HUD lines
 
 /* ------------------------------------------------------------------ */
@@ -892,6 +945,33 @@ input bool   InpLeaderboard       = true;       // cross-chart Master Score lead
 input int    InpLeaderboardRows   = 3;          // leaderboard rows shown
 input bool   InpSessionCountdown  = true;       // "NEXT: LONDON opens in 41m" HUD line
 
+input group "Regime & Volatility (v16.00)"
+input bool   InpRegime           = true;        // Hurst + Kaufman ER regime classification (TRENDING/RANGING/TRANSITION)
+input int    InpRegimeBars       = 100;         // lookback window for Hurst / KER
+input bool   InpVcv              = true;        // Bollinger-inside-Keltner volatility contraction (squeeze/cone)
+
+input group "Confluence Fusion (v17.00)"
+input bool   InpConfluence       = true;        // stack independent signals into a 0-100 agreement score
+
+input group "Pattern Geometry (v18.00)"
+input bool   InpHarmonics        = true;        // XABCD harmonic pattern scan (Gartley/Bat/Butterfly/Crab)
+input double InpHarmonicTolPct   = 6.0;         // tolerance band (% of leg) around each canonical ratio
+input bool   InpElliottWave      = true;        // simplified Elliott Wave count over confirmed swings
+
+input group "Macro Crosscurrents (v19.00)"
+input bool   InpYieldCurve       = false;       // yield curve spread + inversion flag (needs bond CFD symbols)
+input string InpYieldShort       = "";          // short-end bond CFD symbol, e.g. "US2Y"
+input string InpYieldLong        = "";          // long-end bond CFD symbol, e.g. "US10Y"
+input bool   InpLeadLag          = false;       // intermarket lead/lag flash
+input string InpLeadSymbol       = "";          // correlated leading symbol to watch
+input double InpLeadAtrMult      = 0.8;         // flash when the lead symbol moves >= this x its own ATR
+
+input group "The Oracle (v20.00)"
+input bool   InpOracleScore      = true;        // master 45% + confluence 25% + flow 15% + regime 15% fusion
+input int    InpOracleGoAt       = 85;          // Oracle Score >= this flashes PERFECT SETUP
+input bool   InpJournal          = true;        // double-click chart to pin a price/time note
+input string InpJournalFile      = "PAICT_Notes.csv"; // journal file under MQL5\Files\
+
 input group "Style"
 input int    InpExtendRightBars = 8;             // Right-edge extension of boxes
 input bool   InpShowLabels      = true;          // Small text labels beside objects
@@ -1034,6 +1114,8 @@ SSandbox g_sb;
 bool     g_sbDirty       = false; // a line was dragged — refresh HUD + payload
 int      g_masterScore   = -1;    // 0..100 (-1 = not computable)
 string   g_masterVerdict = "";    // GO / WAIT / NO TRADE
+int      g_oracleScore   = -1;    // v20.00: fused 0..100 (-1 = not computable)
+bool     g_oraclePerfect = false; // v20.00: g_oracleScore >= InpOracleGoAt
 bool     g_setupMuted    = false; // attach chart's self-heal mute state (HUD + payload)
 
 // Attach chart's zenith metric snapshot for the bridge payload — filled in
@@ -1072,6 +1154,29 @@ struct SZenSnap
    double statsWinPct;       // v13.00: journal win rate %
    double statsExpectancyR;  // v13.00: journal expectancy in R-multiples
    int    statsTrades;       // v13.00: journal trade count used
+   // v16.00-v20.00: Oracle engine
+   string regime;
+   double hurst;
+   double ker;
+   double vcvSqueeze;
+   bool   vcvCone;
+   int    confluence;
+   int    confCount;
+   string confTags;
+   string harmonic;
+   int    harmDir;
+   double przLo;
+   double przHi;
+   string elliott;
+   int    ewDir;
+   bool   ycOk;
+   double ycSpread;
+   bool   ycInverted;
+   string leadSym;
+   double leadMove;
+   int    leadDir;
+   bool   leadFlash;
+   int    oracleScore;
   };
 SZenSnap g_zen;
 
@@ -1085,6 +1190,25 @@ SZenSnap g_zen;
 string   g_lastAlertKind[3]    = {"ENTRY", "STOP", "TARGET"};
 string   g_lastAlertPlanKey[3] = {"", "", ""};
 datetime g_lastAlertTimeAt[3]  = {0, 0, 0};
+
+/* ------------------------------------------------------------------ */
+/* v20.00 on-chart journal — double-click a chart to pin a note at the */
+/* clicked price/time; persisted to MQL5\Files\InpJournalFile and      */
+/* pushed as notes[] in the bridge payload.                            */
+/* ------------------------------------------------------------------ */
+struct SJournalNote
+  {
+   string   timeStr;   // ISO-ish string for the JSON payload
+   datetime t;          // pinned bar time
+   double   price;      // pinned price
+   string   text;       // note body
+  };
+SJournalNote g_journalNotes[];
+ulong        g_lastClickMs   = 0;      // GetTickCount() of the previous click
+int          g_lastClickX    = -1000;
+int          g_lastClickY    = -1000;
+#define JOURNAL_DBLCLICK_MS   400      // max gap between clicks to count as a double-click
+#define JOURNAL_DBLCLICK_PX   6        // max pixel drift between the two clicks
 
 /* ------------------------------------------------------------------ */
 /* v13.00 performance analytics state                                  */
@@ -1183,6 +1307,33 @@ struct SMarketState
    string           volRegime;        // "HIGH" / "NORMAL" / "LOW"
    double           volRatio;         // ATR / trailing average ATR
    double           suggestedRiskPct; // scaled-down risk % suggestion (HIGH regime only)
+   // v16.00: market regime + volatility contraction
+   string           regime;           // "TRENDING" / "RANGING" / "TRANSITION"
+   double           hurst;            // R/S Hurst exponent (0..1, ~0.5 = random walk)
+   double           ker;              // Kaufman Efficiency Ratio (0..1)
+   double           vcvSqueeze;       // Bollinger-inside-Keltner squeeze ratio (<1 = squeezed)
+   bool             vcvCone;          // squeeze actively narrowing bar-over-bar
+   // v17.00: confluence fusion
+   int              confluence;       // 0-100 agreement score for the active plan direction
+   int              confCount;        // number of independent signals agreeing
+   string           confTags;         // "OB+FVG+CVD"
+   // v18.00: harmonic pattern + Elliott wave
+   string           harmonic;         // "GARTLEY" / "BAT" / "BUTTERFLY" / "CRAB" / "" (none)
+   int              harmDir;          // +1 bullish PRZ, -1 bearish PRZ, 0 none
+   double           przLo;
+   double           przHi;
+   string           elliott;          // e.g. "WAVE 3" / "WAVE C" / ""
+   int              ewDir;            // +1 up, -1 down, 0 unclear
+   // v19.00: yield curve + lead/lag
+   double           ycSpread;
+   bool             ycInverted;
+   bool             ycOk;
+   string           leadSym;
+   double           leadMove;         // move in units of the lead symbol's own ATR
+   int              leadDir;
+   bool             leadFlash;
+   // v20.00: oracle score
+   int              oracleScore;
   };
 
 /* ------------------------------------------------------------------ */
@@ -1204,6 +1355,17 @@ int OnInit()
    g_sbDirty      = false;
    g_masterScore  = -1;
    g_masterVerdict = "";
+   g_oracleScore  = -1;
+   g_oraclePerfect = false;
+
+   // v20.00: reload persisted journal notes and redraw their pins on the
+   // attach chart so a re-init/re-compile doesn't lose them from view.
+   if(InpJournal)
+     {
+      LoadJournalNotes();
+      for(int ji = 0; ji < ArraySize(g_journalNotes); ji++)
+         DrawJournalNote(ChartID(), g_journalNotes[ji], ji);
+     }
 
    // Force a fresh redraw pass after re-compile / input change: globals
    // survive OnDeinit+OnInit on REPARAMETERS, and the new-bar gate would
@@ -1855,12 +2017,146 @@ void SandboxReadDragged()
      }
   }
 
+//+------------------------------------------------------------------+
+//| v20.00 journal — load persisted notes from MQL5\Files\ at start.   |
+//+------------------------------------------------------------------+
+void LoadJournalNotes()
+  {
+   ArrayResize(g_journalNotes, 0);
+   ResetLastError();
+   const int h = FileOpen(InpJournalFile, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+   if(h == INVALID_HANDLE)
+      return;                          // no file yet — nothing to load
+   if(!FileIsEnding(h))
+      FileReadString(h);               // skip header row
+   while(!FileIsEnding(h))
+     {
+      const string t   = FileReadString(h);
+      const double p   = StringToDouble(FileReadString(h));
+      const string txt = FileReadString(h);
+      if(t == "" && txt == "")
+         continue;
+      const int n = ArraySize(g_journalNotes);
+      ArrayResize(g_journalNotes, n + 1);
+      g_journalNotes[n].timeStr = t;
+      g_journalNotes[n].t       = StringToTime(t);
+      g_journalNotes[n].price   = p;
+      g_journalNotes[n].text    = txt;
+     }
+   FileClose(h);
+  }
+
+//+------------------------------------------------------------------+
+//| v20.00 journal — append one note to the CSV (create + header on    |
+//| first write, matching the trade-journal file pattern above).       |
+//+------------------------------------------------------------------+
+void AppendJournalNoteCSV(const SJournalNote &note)
+  {
+   const int h = FileOpen(InpJournalFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ, ',');
+   if(h == INVALID_HANDLE)
+     {
+      Print("PAICT journal: cannot open ", InpJournalFile, " (error ", GetLastError(),
+            ") — note not persisted.");
+      return;
+     }
+   if(FileSize(h) == 0)
+      FileWrite(h, "time", "price", "text");
+   FileSeek(h, 0, SEEK_END);
+   FileWrite(h, note.timeStr, DoubleToString(note.price, _Digits), note.text);
+   FileClose(h);
+  }
+
+//+------------------------------------------------------------------+
+//| v20.00 journal — pin an OBJ_TEXT marker + arrow at the note's      |
+//| price/time so it stays visible on the chart it was created on.     |
+//+------------------------------------------------------------------+
+void DrawJournalNote(const long chart_id, const SJournalNote &note, const int idx)
+  {
+   const string name = OBJ_PREFIX + "NOTE_" + IntegerToString(idx);
+   ObjectCreate(chart_id, name, OBJ_TEXT, 0, note.t, note.price);
+   ObjectSetString(chart_id, name, OBJPROP_TEXT, "\xF0\x9F\x93\x8C " + note.text);
+   ObjectSetInteger(chart_id, name, OBJPROP_COLOR, COL_KZ_LON);
+   ObjectSetInteger(chart_id, name, OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(chart_id, name, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(chart_id, name, OBJPROP_SELECTABLE, false);
+  }
+
+//+------------------------------------------------------------------+
+//| v20.00 journal — finish a pending note: read the OBJ_EDIT text,    |
+//| drop the edit box, persist + draw the pin.                         |
+//+------------------------------------------------------------------+
+void FinishJournalEdit(const long chart_id, const string editName)
+  {
+   const string txt = ObjectGetString(chart_id, editName, OBJPROP_TEXT);
+   const datetime t = (datetime)ObjectGetInteger(chart_id, editName, OBJPROP_TIME);
+   const double   p = ObjectGetDouble(chart_id, editName, OBJPROP_PRICE);
+   ObjectDelete(chart_id, editName);
+   if(StringLen(txt) == 0)
+      return;                          // empty note = cancelled
+
+   const int n = ArraySize(g_journalNotes);
+   ArrayResize(g_journalNotes, n + 1);
+   g_journalNotes[n].t       = t;
+   g_journalNotes[n].timeStr = TimeToString(t, TIME_DATE|TIME_SECONDS);
+   g_journalNotes[n].price   = p;
+   g_journalNotes[n].text    = txt;
+   AppendJournalNoteCSV(g_journalNotes[n]);
+   DrawJournalNote(chart_id, g_journalNotes[n], n);
+  }
+
 void OnChartEvent(const int id, const long &lparam, const double &dparam,
                   const string &sparam)
   {
    if(id == CHARTEVENT_OBJECT_DRAG && InpSandbox &&
       StringFind(sparam, OBJ_PREFIX + "SB_") == 0)
       SandboxReadDragged();
+
+   // v20.00: double-click detection (MQL5 has no native dblclick event) —
+   // two CHARTEVENT_CLICKs within JOURNAL_DBLCLICK_MS ms and
+   // JOURNAL_DBLCLICK_PX px of each other count as one. Opens a small
+   // OBJ_EDIT box pinned at the clicked price/time for the note text;
+   // CHARTEVENT_OBJECT_ENDEDIT below reads it back.
+   if(id == CHARTEVENT_CLICK && InpJournal)
+     {
+      const long   chart_id = ChartID();
+      const int    x = (int)lparam;
+      const int    y = (int)dparam;
+      const ulong  now = GetTickCount();
+      const bool   isDouble = (now - g_lastClickMs <= JOURNAL_DBLCLICK_MS) &&
+                              (MathAbs(x - g_lastClickX) <= JOURNAL_DBLCLICK_PX) &&
+                              (MathAbs(y - g_lastClickY) <= JOURNAL_DBLCLICK_PX);
+      g_lastClickMs = now;
+      g_lastClickX  = x;
+      g_lastClickY  = y;
+      if(isDouble)
+        {
+         g_lastClickMs = 0;   // consume — a third rapid click starts fresh
+         datetime t; double p;
+         int sub_window;
+         if(ChartXYToTimePrice(chart_id, x, y, sub_window, t, p))
+           {
+            const string editName = OBJ_PREFIX + "NOTE_EDIT";
+            ObjectDelete(chart_id, editName);
+            ObjectCreate(chart_id, editName, OBJ_EDIT, 0, 0, 0);
+            ObjectSetInteger(chart_id, editName, OBJPROP_XDISTANCE, x);
+            ObjectSetInteger(chart_id, editName, OBJPROP_YDISTANCE, y);
+            ObjectSetInteger(chart_id, editName, OBJPROP_XSIZE, 180);
+            ObjectSetInteger(chart_id, editName, OBJPROP_YSIZE, 20);
+            ObjectSetInteger(chart_id, editName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+            ObjectSetInteger(chart_id, editName, OBJPROP_TIME, t);
+            ObjectSetDouble(chart_id, editName, OBJPROP_PRICE, p);
+            ObjectSetString(chart_id, editName, OBJPROP_TEXT, "");
+            ObjectSetString(chart_id, editName, OBJPROP_TOOLTIP, "Type a note, press Enter");
+            ObjectSetInteger(chart_id, editName, OBJPROP_BGCOLOR, clrWhite);
+            ObjectSetInteger(chart_id, editName, OBJPROP_SELECTABLE, true);
+            ChartRedraw(chart_id);
+           }
+        }
+     }
+
+   if(id == CHARTEVENT_OBJECT_ENDEDIT && InpJournal &&
+      sparam == OBJ_PREFIX + "NOTE_EDIT")
+      FinishJournalEdit(ChartID(), sparam);
   }
 
 /* ------------------------------------------------------------------ */
@@ -2203,6 +2499,121 @@ void ComputeVolRegime(const double atr, const double atrAvg, const double riskPc
      }
    else if(ratio <= VOL_LOW_RATIO)
       regime = "LOW";
+  }
+
+//+------------------------------------------------------------------+
+//| v16.00 — Hurst exponent via rescaled-range (R/S) analysis over the  |
+//| last `bars` closed-bar log returns. H > 0.55 trending, H < 0.45    |
+//| mean-reverting/ranging, else a random-walk transition band.        |
+//+------------------------------------------------------------------+
+double ComputeHurst(const MqlRates &rates[], const int lastClosed, const int bars)
+  {
+   const int n = MathMin(bars, lastClosed);
+   if(n < 20)
+      return(0.5);
+   double ret[];
+   ArrayResize(ret, n);
+   for(int i = 0; i < n; i++)
+     {
+      const int a = lastClosed - n + i;
+      const double c0 = rates[a].close;
+      const double c1 = rates[a + 1].close;
+      ret[i] = (c0 > 0.0) ? MathLog(c1 / c0) : 0.0;
+     }
+   double mean = 0.0;
+   for(int i = 0; i < n; i++)
+      mean += ret[i];
+   mean /= n;
+   double cum = 0.0, minC = 0.0, maxC = 0.0, sumSq = 0.0;
+   for(int i = 0; i < n; i++)
+     {
+      cum   += (ret[i] - mean);
+      minC   = MathMin(minC, cum);
+      maxC   = MathMax(maxC, cum);
+      sumSq += (ret[i] - mean) * (ret[i] - mean);
+     }
+   const double range = maxC - minC;
+   const double sd     = MathSqrt(sumSq / n);
+   if(sd <= 0.0 || range <= 0.0)
+      return(0.5);
+   const double rs = range / sd;
+   // H = log(R/S) / log(n) — the standard single-window R/S estimator.
+   const double h = MathLog(rs) / MathLog((double)n);
+   return(MathMax(0.0, MathMin(1.0, h)));
+  }
+
+//+------------------------------------------------------------------+
+//| v16.00 — Kaufman Efficiency Ratio: net displacement over the sum   |
+//| of bar-to-bar movement, 0 (pure noise) .. 1 (pure trend).           |
+//+------------------------------------------------------------------+
+double ComputeKER(const MqlRates &rates[], const int lastClosed, const int bars)
+  {
+   const int n = MathMin(bars, lastClosed);
+   if(n < 5)
+      return(0.0);
+   const double net = MathAbs(rates[lastClosed].close - rates[lastClosed - n].close);
+   double vol = 0.0;
+   for(int i = lastClosed - n + 1; i <= lastClosed; i++)
+      vol += MathAbs(rates[i].close - rates[i - 1].close);
+   return((vol > 0.0) ? MathMin(1.0, net / vol) : 0.0);
+  }
+
+//+------------------------------------------------------------------+
+//| v16.00 — combine Hurst + KER into one regime label.                 |
+//+------------------------------------------------------------------+
+void ComputeRegime(const MqlRates &rates[], const int lastClosed, const int bars,
+                   double &hurst, double &ker, string &regime)
+  {
+   hurst  = ComputeHurst(rates, lastClosed, bars);
+   ker    = ComputeKER(rates, lastClosed, bars);
+   if(hurst >= 0.55 && ker >= 0.30)
+      regime = "TRENDING";
+   else if(hurst <= 0.45 && ker < 0.30)
+      regime = "RANGING";
+   else
+      regime = "TRANSITION";
+  }
+
+//+------------------------------------------------------------------+
+//| v16.00 — Volatility Contraction (VCV): Bollinger-inside-Keltner     |
+//| squeeze, expressed as (Bollinger width / Keltner width). < 1.0     |
+//| means price is coiled inside the Keltner channel (a "squeeze").    |
+//| `cone` flags the squeeze actively narrowing vs. the prior bar.     |
+//+------------------------------------------------------------------+
+double ComputeVcv(const MqlRates &rates[], const int lastClosed, const double atr,
+                  const int period, bool &cone)
+  {
+   cone = false;
+   const int n = MathMin(period, lastClosed);
+   if(n < 5 || atr <= 0.0)
+      return(1.0);
+   double sum = 0.0;
+   for(int i = lastClosed - n + 1; i <= lastClosed; i++)
+      sum += rates[i].close;
+   const double ma = sum / n;
+   double sq = 0.0;
+   for(int i = lastClosed - n + 1; i <= lastClosed; i++)
+      sq += (rates[i].close - ma) * (rates[i].close - ma);
+   const double sd = MathSqrt(sq / n);
+   const double bbWidth = 2.0 * 2.0 * sd;      // Bollinger(2,2): +/-2 SD
+   const double kcWidth = 2.0 * 1.5 * atr;     // Keltner(1.5xATR)
+   const double squeeze = (kcWidth > 0.0) ? bbWidth / kcWidth : 1.0;
+
+   // one-bar-back comparison to tell whether the squeeze is narrowing
+   if(lastClosed - n >= n)
+     {
+      double sumPrev = 0.0;
+      for(int i = lastClosed - 1 - n + 1; i <= lastClosed - 1; i++)
+         sumPrev += rates[i].close;
+      const double maPrev = sumPrev / n;
+      double sqPrev = 0.0;
+      for(int i = lastClosed - 1 - n + 1; i <= lastClosed - 1; i++)
+         sqPrev += (rates[i].close - maPrev) * (rates[i].close - maPrev);
+      const double sdPrev = MathSqrt(sqPrev / n);
+      const double bbPrev = 2.0 * 2.0 * sdPrev;
+      cone = (squeeze < 1.0 && bbWidth < bbPrev);
+     }
+   return(squeeze);
   }
 
 //+------------------------------------------------------------------+
@@ -2818,6 +3229,29 @@ void MarketStateReset(SMarketState &st)
    st.volRegime       = "";
    st.volRatio        = 0.0;
    st.suggestedRiskPct = 0.0;
+   // v16.00-v20.00
+   st.regime      = "";
+   st.hurst       = 0.0;
+   st.ker         = 0.0;
+   st.vcvSqueeze  = 0.0;
+   st.vcvCone     = false;
+   st.confluence  = 0;
+   st.confCount   = 0;
+   st.confTags    = "";
+   st.harmonic    = "";
+   st.harmDir     = 0;
+   st.przLo       = 0.0;
+   st.przHi       = 0.0;
+   st.elliott     = "";
+   st.ewDir       = 0;
+   st.ycSpread    = 0.0;
+   st.ycInverted  = false;
+   st.ycOk        = false;
+   st.leadSym     = "";
+   st.leadMove    = 0.0;
+   st.leadDir     = 0;
+   st.leadFlash   = false;
+   st.oracleScore = -1;
   }
 
 // Attach chart's latest plan — the Web Bridge reads THIS (v2.07: no more
@@ -2965,6 +3399,32 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
      {
       const double atrAvg = GetAtrAverage(symbol, tf, MathMax(5, InpVolRegimeBars));
       ComputeVolRegime(st.atr, atrAvg, g_ov.riskPct, st.volRegime, st.volRatio, st.suggestedRiskPct);
+     }
+
+   /* --------------------- v16.00: regime + VCV ---------------------- */
+   if(InpRegime)
+      ComputeRegime(rates, st.lastClosed, MathMax(20, InpRegimeBars), st.hurst, st.ker, st.regime);
+   if(InpVcv && st.atr > 0.0)
+      st.vcvSqueeze = ComputeVcv(rates, st.lastClosed, st.atr, MathMax(5, InpATRPeriod), st.vcvCone);
+
+   /* --------------------- v17.00: confluence fusion ------------------ */
+   if(InpConfluence)
+      st.confluence = ComputeConfluence(st, st.confCount, st.confTags);
+
+   /* --------------------- v18.00: harmonic + Elliott ------------------ */
+   if(InpHarmonics)
+      ComputeHarmonic(st.hiIdx, st.hiVal, st.nHi, st.loIdx, st.loVal, st.nLo,
+                      InpHarmonicTolPct, st.harmonic, st.harmDir, st.przLo, st.przHi);
+   if(InpElliottWave)
+      ComputeElliott(st.hiIdx, st.hiVal, st.nHi, st.loIdx, st.loVal, st.nLo, st.elliott, st.ewDir);
+
+   /* --------------------- v19.00: macro crosscurrents ------------------ */
+   if(InpYieldCurve)
+      st.ycOk = ComputeYieldCurve(InpYieldShort, InpYieldLong, st.ycSpread, st.ycInverted);
+   if(InpLeadLag)
+     {
+      st.leadSym = InpLeadSymbol;
+      ComputeLeadLag(InpLeadSymbol, InpLeadAtrMult, st.leadMove, st.leadDir, st.leadFlash);
      }
 
    st.ok = true;
@@ -3150,6 +3610,14 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       // the globals above hold THIS chart's numbers right now.
       if(InpLeaderboard)
          UpdateLeaderboard(st.symbol, st.tf, g_masterScore, g_masterVerdict);
+      // v20.00: the Oracle Score fuses this chart's just-computed Master
+      // Score with its confluence read — must run after g_masterScore above.
+      if(InpOracleScore)
+        {
+         g_oracleScore   = ComputeOracleScore(st, g_masterScore, st.confluence);
+         g_oraclePerfect = (g_oracleScore >= MathMax(1, InpOracleGoAt));
+         RenderOracleLabel(chart_id);
+        }
      }
    // v15.02: rendered AFTER the update above (and after RenderZenithHUD,
    // whose fractal/MC/correlation reads the Master Score above depends
@@ -3248,6 +3716,29 @@ void DrawOnChart(const long chart_id, const string symbol, const ENUM_TIMEFRAMES
       g_zen.statsWinPct      = g_statsWinPct;
       g_zen.statsExpectancyR = g_statsExpR;
       g_zen.statsTrades      = g_statsTrades;
+      // v16.00-v20.00: Oracle engine bridge payload
+      g_zen.regime      = st.regime;
+      g_zen.hurst       = st.hurst;
+      g_zen.ker         = st.ker;
+      g_zen.vcvSqueeze  = st.vcvSqueeze;
+      g_zen.vcvCone     = st.vcvCone;
+      g_zen.confluence  = st.confluence;
+      g_zen.confCount   = st.confCount;
+      g_zen.confTags    = st.confTags;
+      g_zen.harmonic    = st.harmonic;
+      g_zen.harmDir     = st.harmDir;
+      g_zen.przLo       = st.przLo;
+      g_zen.przHi       = st.przHi;
+      g_zen.elliott     = st.elliott;
+      g_zen.ewDir       = st.ewDir;
+      g_zen.ycOk        = st.ycOk;
+      g_zen.ycSpread    = st.ycSpread;
+      g_zen.ycInverted  = st.ycInverted;
+      g_zen.leadSym     = st.leadSym;
+      g_zen.leadMove    = st.leadMove;
+      g_zen.leadDir     = st.leadDir;
+      g_zen.leadFlash   = st.leadFlash;
+      g_zen.oracleScore = g_oracleScore;
      }
 
    /* --------------------- JSON export hook (opt-in) --------------- */
@@ -5955,6 +6446,17 @@ int ComputeMasterScore(const SMarketState &st)
       s += 5;
    if(g_corrWarn)
       s -= 5;
+   // v16.00: gate a trend-continuation plan (fractal-aligned with its own
+   // side) against the regime read — fighting a RANGING chart is penalized,
+   // riding a TRENDING one is rewarded. A plan the fractals disagree with
+   // (alignSide <= 0) is not "continuation" and is left ungated either way.
+   if(InpRegime && alignSide > 0)
+     {
+      if(st.regime == "RANGING")
+         s -= 15;
+      else if(st.regime == "TRENDING")
+         s += 5;
+     }
    SHeat h;
    ComputePortfolioHeat(h);
    if(h.alert)
@@ -5964,6 +6466,235 @@ int ComputeMasterScore(const SMarketState &st)
    if(NewsBlackoutActive(nt, nn))
       s = (int)(s * 0.2);
    return((int)MathMax(0.0, MathMin(100.0, s)));
+  }
+
+//+------------------------------------------------------------------+
+//| v17.00 — Confluence Fusion: counts how many independent reads      |
+//| already computed for this chart agree with the active plan's       |
+//| direction, and turns the count into a 0-100 score + tag string.    |
+//+------------------------------------------------------------------+
+int ComputeConfluence(const SMarketState &st, int &confCount, string &confTags)
+  {
+   confCount = 0;
+   confTags  = "";
+   if(!st.planOk)
+      return(0);
+   const bool isLong = (st.planTarget > st.planEntry);
+   const int  dir    = isLong ? 1 : -1;
+
+   if(st.bullIdx >= 0 && isLong)  { confCount++; confTags += (confTags == "" ? "" : "+") + string("OB"); }
+   if(st.bearIdx >= 0 && !isLong) { confCount++; confTags += (confTags == "" ? "" : "+") + string("OB"); }
+   if(st.fvgCount > 0)            { confCount++; confTags += (confTags == "" ? "" : "+") + string("FVG"); }
+   if(st.structCount > 0)         { confCount++; confTags += (confTags == "" ? "" : "+") + string("STRUCT"); }
+   if((isLong && ArraySize(st.sslLv) > 0) || (!isLong && ArraySize(st.bslLv) > 0))
+                                   { confCount++; confTags += (confTags == "" ? "" : "+") + string("LIQ"); }
+   if(st.oteOk && st.oteBullish == isLong)
+                                   { confCount++; confTags += (confTags == "" ? "" : "+") + string("OTE"); }
+   const int alignSide = (isLong ? g_alignScore : -g_alignScore);
+   if(alignSide > 0)              { confCount++; confTags += (confTags == "" ? "" : "+") + string("FRACTAL"); }
+   if(!g_corrWarn && g_corrSym != "")
+                                   { confCount++; confTags += (confTags == "" ? "" : "+") + string("CORR"); }
+   if(g_cvdDir == dir)            { confCount++; confTags += (confTags == "" ? "" : "+") + string("CVD"); }
+   if(g_mcTP >= 55.0)             { confCount++; confTags += (confTags == "" ? "" : "+") + string("MC"); }
+   if(InpRegime && st.regime == "TRENDING" && alignSide > 0)
+                                   { confCount++; confTags += (confTags == "" ? "" : "+") + string("REGIME"); }
+
+   const int total = 10;
+   return((int)MathRound(100.0 * confCount / total));
+  }
+
+//+------------------------------------------------------------------+
+//| v18.00 — Harmonic XABCD scan. Walks the last 5 confirmed swing     |
+//| points (X-A-B-C-D) drawn from the shared hi/lo swing arrays and    |
+//| tests the AB/XA, BC/AB and CD/BC ratios against each pattern's     |
+//| canonical Fibonacci bands (tolerance-widened). Heuristic, not a    |
+//| certified harmonic scanner.                                        |
+//+------------------------------------------------------------------+
+bool RatioNear(const double ratio, const double target, const double tolPct)
+  {
+   const double tol = target * (tolPct / 100.0);
+   return(ratio >= target - tol && ratio <= target + tol);
+  }
+
+bool ComputeHarmonic(const int hiIdx[], const double hiVal[], const int nHi,
+                     const int loIdx[], const double loVal[], const int nLo,
+                     const double tolPct, string &pattern, int &dir,
+                     double &przLo, double &przHi)
+  {
+   pattern = ""; dir = 0; przLo = 0.0; przHi = 0.0;
+   // merge the last few highs/lows chronologically into one swing series
+   int    idx[]; double val[];
+   int    ih = 0, il = 0;
+   while(ih < nHi && il < nLo)
+     {
+      if(hiIdx[ih] > loIdx[il]) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = hiIdx[ih]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = hiVal[ih]; ih++; }
+      else                      { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = loIdx[il]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = loVal[il]; il++; }
+     }
+   while(ih < nHi) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = hiIdx[ih]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = hiVal[ih]; ih++; }
+   while(il < nLo) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = loIdx[il]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = loVal[il]; il++; }
+
+   const int cnt = ArraySize(idx);
+   if(cnt < 5)
+      return(false);
+   // most recent 5 points, oldest first: X A B C D
+   const double X = val[cnt - 5], A = val[cnt - 4], B = val[cnt - 3], C = val[cnt - 2], D = val[cnt - 1];
+   const double legXA = MathAbs(A - X);
+   const double legAB = MathAbs(B - A);
+   const double legBC = MathAbs(C - B);
+   const double legCD = MathAbs(D - C);
+   if(legXA <= 0.0 || legAB <= 0.0 || legBC <= 0.0)
+      return(false);
+   const double abXa = legAB / legXA;
+   const double bcAb = legBC / legAB;
+
+   bool bullish = (X < A) && (B < A) && (C > B) && (D < C);   // D makes the lowest low = bullish reversal (long PRZ)
+   bool bearish = (X > A) && (B > A) && (C < B) && (D > C);
+
+   // canonical AB=XA retracement bands per pattern
+   string patNames[4] = {"GARTLEY", "BAT", "BUTTERFLY", "CRAB"};
+   double patAb[4]     = {0.618, 0.50, 0.786, 0.618};
+
+   for(int i = 0; i < 4; i++)
+     {
+      if(!RatioNear(abXa, patAb[i], tolPct))
+         continue;
+      if(bcAb < 0.30 || bcAb > 0.95)     // BC must be a real retracement of AB
+         continue;
+      if(bullish || bearish)
+        {
+         pattern = patNames[i];
+         dir     = bullish ? 1 : -1;
+         const double przCenter = D;
+         const double band      = legCD * (tolPct / 100.0) * 2.0;
+         przLo = przCenter - band;
+         przHi = przCenter + band;
+         return(true);
+        }
+     }
+   return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| v18.00 — simplified Elliott Wave read: classifies the same swing   |
+//| series as an impulse leg (1-5, reported as its current leg) or a   |
+//| corrective ABC, purely from alternating swing direction + length.  |
+//+------------------------------------------------------------------+
+void ComputeElliott(const int hiIdx[], const double hiVal[], const int nHi,
+                    const int loIdx[], const double loVal[], const int nLo,
+                    string &wave, int &dir)
+  {
+   wave = ""; dir = 0;
+   int    idx[]; double val[];
+   int    ih = 0, il = 0;
+   while(ih < nHi && il < nLo)
+     {
+      if(hiIdx[ih] > loIdx[il]) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = hiIdx[ih]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = hiVal[ih]; ih++; }
+      else                      { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = loIdx[il]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = loVal[il]; il++; }
+     }
+   while(ih < nHi) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = hiIdx[ih]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = hiVal[ih]; ih++; }
+   while(il < nLo) { ArrayResize(idx, ArraySize(idx) + 1); idx[ArraySize(idx) - 1] = loIdx[il]; ArrayResize(val, ArraySize(val) + 1); val[ArraySize(val) - 1] = loVal[il]; il++; }
+
+   const int cnt = ArraySize(idx);
+   if(cnt < 6)
+      return;
+   // last 6 points = 5 legs; count consecutive legs that each extend
+   // beyond the previous same-direction leg (an impulse signature) vs.
+   // three legs of roughly overlapping range (a corrective signature).
+   int   sameDirRun = 0;
+   double legs[5];
+   for(int i = 0; i < 5; i++)
+      legs[i] = val[cnt - 5 + i] - val[cnt - 6 + i];
+   for(int i = 1; i < 5; i++)
+      if(MathAbs(legs[i]) > MathAbs(legs[i - 1]) * 0.9)
+         sameDirRun++;
+
+   if(sameDirRun >= 3)
+     {
+      wave = "WAVE " + IntegerToString(MathMin(5, sameDirRun + 2));
+      dir  = (legs[4] > 0) ? 1 : -1;
+     }
+   else
+     {
+      wave = "WAVE C";
+      dir  = (legs[4] > 0) ? 1 : -1;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| v19.00 — yield curve spread (long-end minus short-end bond CFD)    |
+//| and its inversion flag. Silently unavailable (ok=false) when the   |
+//| broker doesn't carry the configured symbols.                       |
+//+------------------------------------------------------------------+
+bool ComputeYieldCurve(const string shortSym, const string longSym,
+                       double &spread, bool &inverted)
+  {
+   spread = 0.0; inverted = false;
+   if(shortSym == "" || longSym == "")
+      return(false);
+   double sp = SymbolInfoDouble(shortSym, SYMBOL_BID);
+   double lp = SymbolInfoDouble(longSym, SYMBOL_BID);
+   if(sp <= 0.0 || lp <= 0.0)
+      return(false);
+   spread   = lp - sp;
+   inverted = (spread < 0.0);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| v19.00 — intermarket lead/lag: has the lead symbol moved past      |
+//| InpLeadAtrMult x its own ATR over the last few closed bars?        |
+//+------------------------------------------------------------------+
+bool ComputeLeadLag(const string leadSym, const double atrMult,
+                    double &moveInAtr, int &dir, bool &flash)
+  {
+   moveInAtr = 0.0; dir = 0; flash = false;
+   if(leadSym == "")
+      return(false);
+   MqlRates lr[];
+   ResetLastError();
+   int total = CopyRates(leadSym, PERIOD_CURRENT, 0, 10, lr);
+   if(total < 6)
+      return(false);
+   const double atr = GetAtr(leadSym, PERIOD_CURRENT);
+   if(atr <= 0.0)
+      return(false);
+   const int last = total - 2;
+   const double move = lr[last].close - lr[MathMax(0, last - 3)].close;
+   moveInAtr = MathAbs(move) / atr;
+   dir       = (move > 0.0) ? 1 : ((move < 0.0) ? -1 : 0);
+   flash     = (moveInAtr >= MathMax(0.01, atrMult));
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| v20.00 — Oracle Score: master 45% + confluence 25% + flow          |
+//| sentiment 15% (CVD direction agreeing with the plan) + regime      |
+//| alignment 15% (TRENDING+aligned or RANGING+countertrend = full     |
+//| credit). >= InpOracleGoAt flashes PERFECT SETUP on the HUD.        |
+//+------------------------------------------------------------------+
+int ComputeOracleScore(const SMarketState &st, const int masterScore, const int confluence)
+  {
+   if(masterScore < 0 || !st.planOk)
+      return(-1);
+   const bool isLong    = (st.planTarget > st.planEntry);
+   const int  alignSide = (isLong ? g_alignScore : -g_alignScore);
+   double flow = 50.0;
+   if(g_cvdDir == (isLong ? 1 : -1))
+      flow = 100.0;
+   else if(g_cvdDir == -(isLong ? 1 : -1))
+      flow = 0.0;
+   double regimeAlign = 50.0;
+   if(InpRegime)
+     {
+      if(st.regime == "TRENDING" && alignSide > 0)
+         regimeAlign = 100.0;
+      else if(st.regime == "RANGING" && alignSide <= 0)
+         regimeAlign = 100.0;
+      else if(st.regime == "RANGING" && alignSide > 0)
+         regimeAlign = 0.0;
+     }
+   const double score = masterScore * 0.45 + confluence * 0.25 + flow * 0.15 + regimeAlign * 0.15;
+   return((int)MathMax(0.0, MathMin(100.0, MathRound(score))));
   }
 
 void RenderMasterScoreLabel(const long chart_id)
@@ -5977,6 +6708,25 @@ void RenderMasterScoreLabel(const long chart_id)
    UpsertLabel(chart_id, OBJ_PREFIX + "HUD_MASTER", x, MASTER_Y,
                g_masterVerdict + " " + IntegerToString(g_masterScore),
                c, MASTER_FONT, "Arial Black", CORNER_LEFT_UPPER);
+  }
+
+//+------------------------------------------------------------------+
+//| v20.00 — Oracle Score HUD line, below the Master Score verdict.    |
+//| >= InpOracleGoAt flashes "PERFECT SETUP" instead of the plain      |
+//| number so it reads as an event, not just another metric.           |
+//+------------------------------------------------------------------+
+void RenderOracleLabel(const long chart_id)
+  {
+   if(g_oracleScore < 0)
+      return;
+   const color c = g_oraclePerfect ? COL_TARGET :
+                   ((g_oracleScore >= 50) ? COL_KZ_LON : COL_STOP);
+   const int width = (int)ChartGetInteger(chart_id, CHART_WIDTH_IN_PIXELS, 0);
+   const int x = MathMax(HUD_X, width / 2 - ORACLE_HALF_W);
+   const string txt = g_oraclePerfect ? "PERFECT SETUP " + IntegerToString(g_oracleScore) :
+                      "ORACLE " + IntegerToString(g_oracleScore);
+   UpsertLabel(chart_id, OBJ_PREFIX + "HUD_ORACLE", x, ORACLE_Y,
+               txt, c, ORACLE_FONT, "Arial Bold", CORNER_LEFT_UPPER);
   }
 
 //+------------------------------------------------------------------+
@@ -6420,6 +7170,69 @@ void AppendZenithJSON(CJsonWriter &w)
       w.AddNum("statsWinPct", g_zen.statsWinPct, 1);
       w.AddNum("statsExpectancyR", g_zen.statsExpectancyR, 2);
       w.AddNum("statsTrades", g_zen.statsTrades, 0);
+     }
+   // v16.00: regime + volatility contraction
+   if(g_zen.regime != "")
+     {
+      w.Add("regime", g_zen.regime);
+      w.AddNum("hurst", g_zen.hurst, 2);
+      w.AddNum("ker", g_zen.ker, 2);
+     }
+   if(g_zen.vcvSqueeze > 0.0)
+     {
+      w.AddNum("vcvSqueeze", g_zen.vcvSqueeze, 2);
+      if(g_zen.vcvCone)
+         w.AddRaw("vcvCone", "true");
+     }
+   // v17.00: confluence fusion
+   if(g_zen.confCount > 0 || g_zen.confluence > 0)
+     {
+      w.AddNum("confluence", g_zen.confluence, 0);
+      w.AddNum("confCount", g_zen.confCount, 0);
+      w.Add("confTags", g_zen.confTags);
+     }
+   // v18.00: harmonic pattern + Elliott wave
+   if(g_zen.harmonic != "")
+     {
+      w.Add("harmonic", g_zen.harmonic);
+      w.AddNum("harmDir", g_zen.harmDir, 0);
+      w.AddNum("przLo", g_zen.przLo, _Digits);
+      w.AddNum("przHi", g_zen.przHi, _Digits);
+     }
+   if(g_zen.elliott != "")
+     {
+      w.Add("elliott", g_zen.elliott);
+      w.AddNum("ewDir", g_zen.ewDir, 0);
+     }
+   // v19.00: macro crosscurrents
+   if(g_zen.ycOk)
+     {
+      w.AddNum("ycSpread", g_zen.ycSpread, 5);
+      w.AddRaw("ycInverted", g_zen.ycInverted ? "true" : "false");
+     }
+   if(g_zen.leadSym != "")
+     {
+      w.Add("leadSym", g_zen.leadSym);
+      w.AddNum("leadMove", g_zen.leadMove, 2);
+      w.AddNum("leadDir", g_zen.leadDir, 0);
+      w.AddRaw("leadFlash", g_zen.leadFlash ? "true" : "false");
+     }
+   // v20.00: Oracle Score
+   if(g_zen.oracleScore >= 0)
+      w.AddNum("oracleScore", g_zen.oracleScore, 0);
+   if(ArraySize(g_journalNotes) > 0)
+     {
+      string nb = "[";
+      for(int i = 0; i < ArraySize(g_journalNotes); i++)
+        {
+         if(i > 0)
+            nb += ",";
+         nb += "{\"time\":\"" + BridgeJsonEscape(g_journalNotes[i].timeStr) + "\",\"price\":" +
+               DoubleToString(g_journalNotes[i].price, _Digits) + ",\"text\":\"" +
+               BridgeJsonEscape(g_journalNotes[i].text) + "\"}";
+        }
+      nb += "]";
+      w.AddRaw("notes", nb);
      }
    if(ArraySize(g_leader) > 0)
      {
