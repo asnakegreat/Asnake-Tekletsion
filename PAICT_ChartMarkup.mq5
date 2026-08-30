@@ -938,6 +938,7 @@ int         g_fastMaP   = 5;
 int         g_slowMaP   = 15;
 int         g_refreshS  = 2;
 long        g_ownChart  = 0;   // chart that owns the single-instance lock
+bool        g_claimed   = false; // true only for the instance that actually claimed GV_OWNER
 string      g_bridgeLastJSON = "";   // web bridge: last payload pushed (dedupe)
 datetime    g_bridgeLastTry  = 0;    // web bridge: last push attempt (throttle)
 datetime    g_bridgeLastBar  = 0;    // web bridge: attach-chart bar at last push
@@ -982,6 +983,7 @@ struct SSetupHeal
    double   planE;      // last plan instance seen (entry) — verdicts are one-per-plan
    double   planS;      // ... (stop)
    double   planT;      // ... (target)
+   bool     judged;      // this plan instance already produced a stop/target verdict
   };
 SSetupHeal g_heal[];                 // self-heal state per symbol|TF
 bool       g_journalWarned = false;  // journal file-open failure — warn once
@@ -1088,7 +1090,8 @@ double   g_statsBalances[];          // cumulative balanceAfter series for the s
 /* ------------------------------------------------------------------ */
 struct SLeaderRow
   {
-   string symbol;
+   string key;        // "SYMBOL|TF" — same symbol on two timeframes gets two rows
+   string label;       // "SYMBOL TF" for display
    int    score;
    string verdict;
   };
@@ -1221,6 +1224,7 @@ int OnInit()
      }
    if(!claimed)
       return(INIT_FAILED);
+   g_claimed = true;
 
    EventSetTimer(g_refreshS);
    // v7.00: subscribe to Depth of Market for the attach symbol (opt-in).
@@ -1282,6 +1286,14 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(InpDrawDOM)
       MarketBookRelease(_Symbol);   // v7.00: drop the DOM subscription
+
+   // A second attach that lost the single-instance lock (OnInit returned
+   // INIT_FAILED) still runs OnDeinit. Chart objects are terminal-wide, not
+   // per-EA-instance, so an unconditional ObjectsDeleteAll here would wipe
+   // the ACTUAL running instance's markup on every open chart. Only the
+   // instance that actually claimed ownership may clean up.
+   if(!g_claimed)
+      return;
 
    long cid = ChartFirst();
    while(cid >= 0)
@@ -1383,6 +1395,7 @@ int HealIndex(const string key, const bool create)
    g_heal[at].planE     = 0.0;
    g_heal[at].planS     = 0.0;
    g_heal[at].planT     = 0.0;
+   g_heal[at].judged    = false;
    return(at);
   }
 
@@ -1419,11 +1432,20 @@ void SelfHealUpdate(const string sym, const ENUM_TIMEFRAMES tf, const MqlRates &
    if(g_heal[at].planE != st.planEntry || g_heal[at].planS != st.planStop ||
       g_heal[at].planT != st.planTarget)
      {
-      g_heal[at].planE = st.planEntry;
-      g_heal[at].planS = st.planStop;
-      g_heal[at].planT = st.planTarget;
+      g_heal[at].planE  = st.planEntry;
+      g_heal[at].planS  = st.planStop;
+      g_heal[at].planT  = st.planTarget;
+      g_heal[at].judged = false;
       return;
      }
+   // Already produced a verdict for THIS plan instance — a stop hit stays
+   // hit even if price lingers beyond it for several more bars, so judging
+   // again here would count one real stop-out as several (tracking
+   // consumption via a separate flag instead of zeroing planS/planT, which
+   // used to make the unchanged plan look "new" again on the next bar).
+   if(g_heal[at].judged)
+      return;
+
    const bool   isLong = (st.planTarget > st.planEntry);
    const double lo     = rates[st.lastClosed].low;
    const double hi     = rates[st.lastClosed].high;
@@ -1433,7 +1455,7 @@ void SelfHealUpdate(const string sym, const ENUM_TIMEFRAMES tf, const MqlRates &
       if(lo <= st.planStop)
         {
          g_heal[at].fails++;
-         g_heal[at].planS = 0.0;         // consume: one verdict per plan
+         g_heal[at].judged = true;
          if(InpSelfHeal && g_heal[at].fails >= limit && g_heal[at].mutedFrom == 0)
            {
             g_heal[at].mutedFrom = st.closedBar;
@@ -1444,8 +1466,8 @@ void SelfHealUpdate(const string sym, const ENUM_TIMEFRAMES tf, const MqlRates &
         }
       else if(hi >= st.planTarget)
         {
-         g_heal[at].fails = 0;
-         g_heal[at].planT = 0.0;         // consumed
+         g_heal[at].fails  = 0;
+         g_heal[at].judged = true;
         }
      }
    else
@@ -1453,7 +1475,7 @@ void SelfHealUpdate(const string sym, const ENUM_TIMEFRAMES tf, const MqlRates &
       if(hi >= st.planStop)
         {
          g_heal[at].fails++;
-         g_heal[at].planS = 0.0;
+         g_heal[at].judged = true;
          if(InpSelfHeal && g_heal[at].fails >= limit && g_heal[at].mutedFrom == 0)
            {
             g_heal[at].mutedFrom = st.closedBar;
@@ -1464,8 +1486,8 @@ void SelfHealUpdate(const string sym, const ENUM_TIMEFRAMES tf, const MqlRates &
         }
       else if(lo <= st.planTarget)
         {
-         g_heal[at].fails = 0;
-         g_heal[at].planT = 0.0;
+         g_heal[at].fails  = 0;
+         g_heal[at].judged = true;
         }
      }
   }
@@ -1665,14 +1687,16 @@ void ScanTradeStats()
    for(int k = 0; k < 11 && !FileIsEnding(h); k++)
       FileReadString(h);          // skip the 11 header fields
 
-   double balances[];
-   int    wins = 0;
-   int    trades = 0;
-   double sumR = 0.0;
-   int    rCount = 0;
-   const int maxRows = MathMax(1, InpStatsMaxRows);
+   // Read every row (the journal is append-only and bounded by real manual
+   // trading volume) then keep only the TRAILING InpStatsMaxRows rows below
+   // — reading with an early cap would freeze the stats on the OLDEST rows
+   // forever once the journal grows past the cap.
+   double allProfit[];
+   double allBal[];
+   double allR[];
+   bool   allHasR[];
 
-   while(!FileIsEnding(h) && trades < maxRows)
+   while(!FileIsEnding(h))
      {
       const string sTime = FileReadString(h);
       if(sTime == "" && FileIsEnding(h))
@@ -1688,13 +1712,8 @@ void ScanTradeStats()
       FileReadString(h);                          // planTarget (unused here)
       FileReadString(h);                          // planRR (unused here)
 
-      trades++;
-      if(profit > 0.0)
-         wins++;
-      const int at = ArraySize(balances);
-      ArrayResize(balances, at + 1, ARRAY_RESERVE_CHUNK);
-      balances[at] = balAfter;
-
+      double  r     = 0.0;
+      bool    hasR  = false;
       if(pe != 0.0 && ps != 0.0 && vol > 0.0)
         {
          const double tickSize  = SymbolInfoDouble(sSym, SYMBOL_TRADE_TICK_SIZE);
@@ -1704,13 +1723,46 @@ void ScanTradeStats()
             const double riskMoney = MathAbs(pe - ps) / tickSize * tickValue * vol;
             if(riskMoney > 0.0)
               {
-               sumR += profit / riskMoney;
-               rCount++;
+               r    = profit / riskMoney;
+               hasR = true;
               }
            }
         }
+
+      const int at = ArraySize(allProfit);
+      ArrayResize(allProfit, at + 1, ARRAY_RESERVE_CHUNK);
+      ArrayResize(allBal,    at + 1, ARRAY_RESERVE_CHUNK);
+      ArrayResize(allR,      at + 1, ARRAY_RESERVE_CHUNK);
+      ArrayResize(allHasR,   at + 1, ARRAY_RESERVE_CHUNK);
+      allProfit[at] = profit;
+      allBal[at]    = balAfter;
+      allR[at]      = r;
+      allHasR[at]   = hasR;
      }
    FileClose(h);
+
+   const int total   = ArraySize(allProfit);
+   const int maxRows = MathMax(1, InpStatsMaxRows);
+   const int start   = MathMax(0, total - maxRows);
+
+   int    wins   = 0;
+   int    trades = 0;
+   double sumR   = 0.0;
+   int    rCount = 0;
+   double balances[];
+   ArrayResize(balances, total - start, ARRAY_RESERVE_CHUNK);
+   for(int i = start; i < total; i++)
+     {
+      trades++;
+      if(allProfit[i] > 0.0)
+         wins++;
+      if(allHasR[i])
+        {
+         sumR += allR[i];
+         rCount++;
+        }
+      balances[i - start] = allBal[i];
+     }
 
    g_statsTrades = trades;
    g_statsWinPct = (trades > 0) ? 100.0 * wins / trades : 0.0;
@@ -1779,6 +1831,10 @@ void SandboxReadDragged()
      {
       g_sb.active = true;
       g_sbDirty   = true;
+      // The new-bar gate in DrawOnChart would otherwise leave the HUD and
+      // the bridge payload showing the pre-drag sandbox levels until the
+      // next closed bar. Force the next cycle to redraw and re-push now.
+      ForceFullRedraw();
      }
   }
 
@@ -2180,7 +2236,7 @@ double ComputeRiskLots(const string symbol, const double entry, const double sto
       lots = MathFloor(lots / step) * step;
    const double minV = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    if(lots < minV)
-      lots = minV;
+      return(0.0);   // no compliant size exists — rounding UP to minV would risk more than riskPct
    return(lots);
   }
 
@@ -2844,9 +2900,14 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
    // A red full-height column spans the blackout window around every
    // high-impact calendar event of the symbol's currencies; the plan
    // BANDS wash out toward the background while it is active.
+   // g_news is populated by ScanNews() from ONLY the ATTACH chart's
+   // _Symbol currencies — applying it to every other covered chart would
+   // wash out an unrelated symbol's plan (or miss its own real news).
+   // Restrict the blackout read to the attach chart until a per-symbol
+   // calendar cache exists.
    datetime newsT    = 0;
    string   newsName = "";
-   const bool blackout = NewsBlackoutActive(newsT, newsName);
+   const bool blackout = (chart_id == ChartID()) && NewsBlackoutActive(newsT, newsName);
    if(blackout)
      {
       const datetime pre  = (datetime)((long)newsT - (long)MathMax(0, InpNewsPreMin) * 60);
@@ -2869,7 +2930,7 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
                   COL_SUPPORT, "DEMAND_" + IntegerToString(d),
                   "demand zone " + IntegerToString(d + 1));
 
-   if(InpDrawTrendLine && (st.nHi >= 2 || st.nLo >= 2))
+   if(InpDrawPriceAction && InpDrawTrendLine && (st.nHi >= 2 || st.nLo >= 2))
       DrawTrendLine(chart_id, rates, st.tf, st.lastClosed,
                     st.nHi, st.hiIdx, st.hiVal, st.nLo, st.loIdx, st.loVal);
 
@@ -2971,7 +3032,7 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       // v15.00: feed this chart's read into the cross-chart leaderboard —
       // the globals above hold THIS chart's numbers right now.
       if(InpLeaderboard)
-         UpdateLeaderboard(st.symbol, g_masterScore, g_masterVerdict);
+         UpdateLeaderboard(st.symbol, st.tf, g_masterScore, g_masterVerdict);
      }
 
    SweepUndrawn(chart_id);
@@ -5827,31 +5888,35 @@ void RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAME
 /* ================================================================== */
 /* v15.00 COCKPIT SUMMARY — cross-chart leaderboard + session countdown */
 /* ================================================================== */
-int LeaderIndex(const string sym, const bool create)
+int LeaderIndex(const string key, const bool create)
   {
    for(int i = 0; i < ArraySize(g_leader); i++)
-      if(g_leader[i].symbol == sym)
+      if(g_leader[i].key == key)
          return(i);
    if(!create)
       return(-1);
    const int at = ArraySize(g_leader);
    ArrayResize(g_leader, at + 1, ARRAY_RESERVE_CHUNK);
-   g_leader[at].symbol  = sym;
+   g_leader[at].key     = key;
+   g_leader[at].label   = key;
    g_leader[at].score   = -1;
    g_leader[at].verdict = "";
    return(at);
   }
 
-void UpdateLeaderboard(const string sym, const int score, const string verdict)
+void UpdateLeaderboard(const string sym, const ENUM_TIMEFRAMES tf, const int score, const string verdict)
   {
-   const int at = LeaderIndex(sym, true);
+   const string tfLabel = TFLabel(tf);
+   const int    at      = LeaderIndex(sym + "|" + tfLabel, true);
+   g_leader[at].label   = sym + " " + tfLabel;
    g_leader[at].score   = score;
    g_leader[at].verdict = verdict;
   }
 
 //+------------------------------------------------------------------+
-//| Drop leaderboard rows for symbols no longer covered by any open    |
-//| chart (a closed chart's last score would otherwise linger forever).|
+//| Drop leaderboard rows for chart/timeframe pairs no longer covered   |
+//| by any open chart (a closed chart's last score would otherwise      |
+//| linger forever).                                                     |
 //+------------------------------------------------------------------+
 void PruneLeaderboard()
   {
@@ -5861,11 +5926,14 @@ void PruneLeaderboard()
      {
       bool alive = false;
       for(int c = 0; c < ArraySize(g_charts); c++)
-         if(ChartSymbol(g_charts[c].chart_id) == g_leader[i].symbol)
+        {
+         const long cid = g_charts[c].chart_id;
+         if(ChartSymbol(cid) + "|" + TFLabel((ENUM_TIMEFRAMES)ChartPeriod(cid)) == g_leader[i].key)
            {
             alive = true;
             break;
            }
+        }
       if(alive)
         {
          if(kept != i)
@@ -5907,7 +5975,7 @@ int RenderLeaderboard(const long chart_id, const int y0)
      {
       const color c = (sorted[i].verdict == "GO") ? COL_TARGET :
                       (sorted[i].verdict == "WAIT" ? COL_KZ_LON : COL_LIQ);
-      joined += (i == 0 ? "" : "  ") + IntegerToString(i + 1) + "." + sorted[i].symbol + " " +
+      joined += (i == 0 ? "" : "  ") + IntegerToString(i + 1) + "." + sorted[i].label + " " +
                (sorted[i].score >= 0 ? IntegerToString(sorted[i].score) : "-");
      }
    UpsertLabel(chart_id, OBJ_PREFIX + "HUD_LEADER", HUD_X, y0, joined, COL_LIQ,
@@ -6146,7 +6214,7 @@ void AppendZenithJSON(CJsonWriter &w)
         {
          if(i > 0)
             lb += ",";
-         lb += "{\"symbol\":\"" + BridgeJsonEscape(g_leader[i].symbol) + "\",\"score\":" +
+         lb += "{\"chart\":\"" + BridgeJsonEscape(g_leader[i].label) + "\",\"score\":" +
                IntegerToString(g_leader[i].score) + ",\"verdict\":\"" +
                BridgeJsonEscape(g_leader[i].verdict) + "\"}";
         }
