@@ -928,6 +928,8 @@ struct SChartState
    long             chart_id;
    datetime         last_bar;   // last CLOSED bar this chart was drawn for
    int              last_data_err;   // v2.07 throttle: last CopyRates error journaled (-1 = none)
+   string           symbol;     // v15.02: symbol this chart was covering last pass
+   ENUM_TIMEFRAMES  tf;         // v15.02: timeframe this chart was covering last pass
   };
 
 SAtrCache   g_atr[];        // cached ATR handles per symbol/tf
@@ -939,6 +941,7 @@ int         g_slowMaP   = 15;
 int         g_refreshS  = 2;
 long        g_ownChart  = 0;   // chart that owns the single-instance lock
 bool        g_claimed   = false; // true only for the instance that actually claimed GV_OWNER
+bool        g_drawSuppressed = false; // v15.02: InpPauseRender/SET_RENDER=0 — Upsert* no-ops, calc keeps running
 string      g_bridgeLastJSON = "";   // web bridge: last payload pushed (dedupe)
 datetime    g_bridgeLastTry  = 0;    // web bridge: last push attempt (throttle)
 datetime    g_bridgeLastBar  = 0;    // web bridge: attach-chart bar at last push
@@ -1345,6 +1348,7 @@ void OnTimer()
   {
    RefreshAll();
    ScanNews();             // v4.00: economic-calendar cache (internally throttled)
+   CheckNewsBlackoutTransition(); // v15.02: force a redraw the instant blackout starts/ends
    ScanTunerFile();        // v5.00: local tuner suggestions (internally throttled)
    ScanTradeStats();       // v13.00: trade-journal win%/expectancy (internally throttled)
    PushMatrixToBridge();   // re-push whenever the plan values changed (deduped)
@@ -1870,11 +1874,26 @@ void RefreshAll()
 
       if(sym != "" && IsSymbolAllowed(sym))
         {
-         if(ChartStateIndex(cid) < 0)
+         const int csAt = ChartStateIndex(cid);
+         if(csAt < 0)
            {
             Print("PAICT: covering ", sym, "@", EnumToString(tf),
                   " (chart ", cid, ") — one attached EA marks every open pair.");
-            ChartStateTouch(cid, 0);          // announced; first draw this pass
+            ChartStateTouch(cid, 0, sym, tf);   // announced; first draw this pass
+           }
+         else if(g_charts[csAt].symbol != sym || g_charts[csAt].tf != tf)
+           {
+            // v15.02: the SAME chart id switched to a different symbol or
+            // timeframe (a user re-used the chart window). The redraw gate
+            // is keyed by chart_id + closed-bar timestamp only, so a new
+            // symbol whose latest bar happens to share that timestamp
+            // would otherwise keep the PREVIOUS symbol's markup on screen
+            // and DualMA handle attached. Treat it as a brand-new chart.
+            Print("PAICT: chart ", cid, " switched ", g_charts[csAt].symbol, "@",
+                  EnumToString(g_charts[csAt].tf), " -> ", sym, "@", EnumToString(tf),
+                  " — resetting.");
+            ChartStateTouch(cid, 0, sym, tf);
+            ReleaseIndicatorFor(cid);
            }
          EnsureIndicators(cid, sym, tf);   // advisory MA layer — never gates markup
          DrawOnChart(cid, sym, tf);
@@ -1897,7 +1916,8 @@ int ChartStateIndex(const long chart_id)
    return(-1);
   }
 
-void ChartStateTouch(const long chart_id, const datetime closed_bar)
+void ChartStateTouch(const long chart_id, const datetime closed_bar, const string symbol,
+                     const ENUM_TIMEFRAMES tf)
   {
    int at = ChartStateIndex(chart_id);
    if(at < 0)
@@ -1908,6 +1928,8 @@ void ChartStateTouch(const long chart_id, const datetime closed_bar)
       g_charts[at].last_data_err = -1;
      }
    g_charts[at].last_bar = closed_bar;
+   g_charts[at].symbol   = symbol;
+   g_charts[at].tf       = tf;
   }
 
 void PruneChartStates()
@@ -1984,6 +2006,30 @@ bool IsSymbolAllowed(const string symbol)
          return(true);
      }
    return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| v15.02: drop a chart's DualMA handle so EnsureIndicators() attaches |
+//| a fresh one — used when a covered chart's symbol/timeframe changed |
+//| under the same chart id (EnsureIndicators is keyed by chart_id      |
+//| only, so it would otherwise keep serving the OLD symbol's handle). |
+//+------------------------------------------------------------------+
+void ReleaseIndicatorFor(const long chart_id)
+  {
+   for(int i = 0; i < ArraySize(g_ind); i++)
+     {
+      if(g_ind[i].chart_id != chart_id)
+         continue;
+      if(g_ind[i].handle != INVALID_HANDLE)
+        {
+         ChartIndicatorDelete(chart_id, 0, IND_SHORTNAME);
+         IndicatorRelease(g_ind[i].handle);
+        }
+      const int last = ArraySize(g_ind) - 1;
+      g_ind[i] = g_ind[last];
+      ArrayResize(g_ind, last);
+      return;
+     }
   }
 
 /* ------------------------------------------------------------------ */
@@ -2384,6 +2430,27 @@ bool NewsBlackoutActive(datetime &eventTime, string &eventName)
   }
 
 //+------------------------------------------------------------------+
+//| v15.02: NewsBlackoutActive() is time-continuous, but the red column |
+//| / plan washout only actually get drawn or removed inside            |
+//| RenderMarketState(), which the new-bar gate can hold off for a      |
+//| whole timeframe. Called every OnTimer tick (cheap — just scans the  |
+//| small cached g_news array) so a blackout starting or ending         |
+//| mid-bar forces a redraw instead of waiting for the next closed bar. |
+//+------------------------------------------------------------------+
+bool g_newsBlackoutWas = false;
+void CheckNewsBlackoutTransition()
+  {
+   datetime nt = 0;
+   string   nn = "";
+   const bool now = NewsBlackoutActive(nt, nn);
+   if(now != g_newsBlackoutWas)
+     {
+      g_newsBlackoutWas = now;
+      ForceFullRedraw();
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Remote control — apply ONE bridge command (whitelisted actions,    |
 //| sanity-clamped values). Writes the g_ov runtime mirrors only.      |
 //+------------------------------------------------------------------+
@@ -2531,6 +2598,8 @@ bool UpsertRect(const long cid, const string name, const datetime t1, const doub
                 const datetime t2, const double p2, const color clr,
                 const bool fill, const bool back, const ENUM_LINE_STYLE style)
   {
+   if(g_drawSuppressed)
+      return(false);
    if(ObjectFind(cid, name) < 0)
      {
       if(!ObjectCreate(cid, name, OBJ_RECTANGLE, 0, t1, p1, t2, p2))
@@ -2560,6 +2629,8 @@ bool UpsertSegment(const long cid, const string name, const datetime t1, const d
                    const datetime t2, const double p2, const color clr,
                    const int width, const ENUM_LINE_STYLE style)
   {
+   if(g_drawSuppressed)
+      return(false);
    if(ObjectFind(cid, name) < 0)
      {
       if(!ObjectCreate(cid, name, OBJ_TREND, 0, t1, p1, t2, p2))
@@ -2590,6 +2661,8 @@ bool UpsertText(const long cid, const string name, const datetime t, const doubl
                 const string text, const color clr, const int fontSize,
                 const string font, const ENUM_ANCHOR_POINT anchor)
   {
+   if(g_drawSuppressed)
+      return(false);
    if(ObjectFind(cid, name) < 0)
      {
       if(!ObjectCreate(cid, name, OBJ_TEXT, 0, t, p))
@@ -2618,6 +2691,8 @@ bool UpsertLabel(const long cid, const string name, const int x, const int y,
                  const string text, const color clr, const int fontSize,
                  const string font, const ENUM_BASE_CORNER corner)
   {
+   if(g_drawSuppressed)
+      return(false);
    if(ObjectFind(cid, name) < 0)
      {
       if(!ObjectCreate(cid, name, OBJ_LABEL, 0, 0, 0))
@@ -2650,6 +2725,8 @@ bool UpsertLabel(const long cid, const string name, const int x, const int y,
 bool UpsertVRect(const long cid, const string name, const datetime t1, const datetime t2,
                  const color clr, const bool fill, const bool back)
   {
+   if(g_drawSuppressed)
+      return(false);
    const string sym = ChartSymbol(cid);
    const double bid = (StringLen(sym) > 0 ? SymbolInfoDouble(sym, SYMBOL_BID) : 0.0);
    const double lo  = (bid > 0.0 ? bid * 0.001  : -1.0e9);   // far below any zoom
@@ -2895,7 +2972,8 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
 //| then SweepUndrawn removes exactly the objects that stopped being   |
 //| valid. Returns the HTF overlay count for the diagnostic journal.   |
 //+------------------------------------------------------------------+
-int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarketState &st)
+int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarketState &st,
+                      const bool setupMuted)
   {
    DrawnReset();
 
@@ -2996,7 +3074,10 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
 
    /* --------------------- HTF overlay (dimmed, labelled) --------- */
    int htfDrawn = 0;
-   if(InpDrawHTF)
+   // v15.02: HTF OB/FVG boxes are still ICT/SMC markup — the InpDrawICT
+   // master toggle (and its per-layer OB/FVG toggles, honored inside
+   // DrawHTFOverlay) must disable them too, not just the chart-TF ones.
+   if(InpDrawHTF && InpDrawICT)
       htfDrawn = DrawHTFOverlay(chart_id, st.symbol, st.tf, rates, st.lastClosed, st.closeRef);
 
    /* --------------------------- Trade Plan ----------------------- */
@@ -3010,9 +3091,17 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       RenderRiskHUD(chart_id, st);
 
    /* ------- V5-V10 zenith analyzers + HUD + sandbox + master ------- */
-   RenderZenithHUD(chart_id, st.symbol, st.tf, st);
+   const int zenHudY = RenderZenithHUD(chart_id, st.symbol, st.tf, st, setupMuted);
    if(InpVolumeProfile)
       DrawVolumeProfile(chart_id, rates, st.tf, st.lastClosed, st);
+   else
+     {
+      // v15.02: layer off — clear the cached levels so AppendZenithJSON()
+      // stops publishing a stale POC/VAH/VAL from a prior render.
+      g_vpPoc = 0.0;
+      g_vpVah = 0.0;
+      g_vpVal = 0.0;
+     }
    if(InpProbabilityCone)
       DrawProbabilityCone(chart_id, rates, st.tf, st.lastClosed, st.closeRef);
    if(InpCVD)
@@ -3058,6 +3147,11 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       if(InpLeaderboard)
          UpdateLeaderboard(st.symbol, st.tf, g_masterScore, g_masterVerdict);
      }
+   // v15.02: rendered AFTER the update above (and after RenderZenithHUD,
+   // whose fractal/MC/correlation reads the Master Score above depends
+   // on) so THIS chart's own just-computed row is never one cycle stale.
+   if(InpLeaderboard)
+      RenderLeaderboard(chart_id, zenHudY);
 
    SweepUndrawn(chart_id);
    return(htfDrawn);
@@ -3094,8 +3188,17 @@ void DrawOnChart(const long chart_id, const string symbol, const ENUM_TIMEFRAMES
 
    // v3.00: drawing can be paused while the state keeps calculating —
    // the bridge keeps pushing the freshest levels the whole time.
-   const bool render   = (!InpPauseRender && g_ov.render);
-   const int  htfDrawn = render ? RenderMarketState(chart_id, rates, st) : 0;
+   // v15.02: RenderMarketState() is now ALWAYS called — the v6-v10
+   // analyzers it drives (fractal alignment, Monte Carlo, correlation,
+   // CVD, displacement grade, Master Score) live INSIDE it, so skipping
+   // the whole call on pause froze them too, despite the documented
+   // "state keeps calculating" promise. g_drawSuppressed instead makes
+   // every Upsert* drawing primitive a no-op while paused; nothing gets
+   // marked drawn, so SweepUndrawn() clears the chart, while every
+   // calculation runs exactly as normal.
+   const bool render = (!InpPauseRender && g_ov.render);
+   g_drawSuppressed  = !render;
+   const int htfDrawn = RenderMarketState(chart_id, rates, st, setupMuted);
 
    // v2.07: the Web Bridge reads the ATTACH chart's plan from this cache —
    // no chart-object scraping, valid even while the chart is hidden.
@@ -3147,7 +3250,7 @@ void DrawOnChart(const long chart_id, const string symbol, const ENUM_TIMEFRAMES
    if(InpExportJSON)
       WriteChartJSON(st, rates);
 
-   ChartStateTouch(chart_id, st.closedBar);
+   ChartStateTouch(chart_id, st.closedBar, symbol, tf);
 
    if(InpVerboseLog)
       Print("PAICT diag ", symbol, "@", EnumToString(tf),
@@ -4395,20 +4498,25 @@ int DrawHTFOverlay(const long chart_id, const string symbol, const ENUM_TIMEFRAM
 
    int drawn = 0;
 
-   int bullH = FindOrderBlock(htfRates, htfLast, dThr, true);
-   int bearH = FindOrderBlock(htfRates, htfLast, dThr, false);
-   if(bullH >= 0)
+   if(InpDrawOB)
      {
-      DrawOrderBlock(chart_id, htfRates, tf, htfLast, bullH, true, closeRef,
-                     "HTF_", htfName + " bullish OB", tEnd, HTF_DIM_STRENGTH);
-      drawn++;
+      int bullH = FindOrderBlock(htfRates, htfLast, dThr, true);
+      int bearH = FindOrderBlock(htfRates, htfLast, dThr, false);
+      if(bullH >= 0)
+        {
+         DrawOrderBlock(chart_id, htfRates, tf, htfLast, bullH, true, closeRef,
+                        "HTF_", htfName + " bullish OB", tEnd, HTF_DIM_STRENGTH);
+         drawn++;
+        }
+      if(bearH >= 0)
+        {
+         DrawOrderBlock(chart_id, htfRates, tf, htfLast, bearH, false, closeRef,
+                        "HTF_", htfName + " bearish OB", tEnd, HTF_DIM_STRENGTH);
+         drawn++;
+        }
      }
-   if(bearH >= 0)
-     {
-      DrawOrderBlock(chart_id, htfRates, tf, htfLast, bearH, false, closeRef,
-                     "HTF_", htfName + " bearish OB", tEnd, HTF_DIM_STRENGTH);
-      drawn++;
-     }
+   if(!InpDrawFVG)
+      return(drawn);
    double   htfFvgLo[];
    double   htfFvgHi[];
    datetime htfFvgT1[];
@@ -4663,7 +4771,11 @@ bool ComputeTradePlan(const MqlRates &rates[], const int lastClosed,
          return(true);
         }
      }
-   else if(bearIdx >= 0)
+   // v15.02: a separate `if`, not `else if` — when BOTH an unmitigated
+   // bullish and bearish OB exist but the bullish one has no valid target
+   // beyond it, the bearish candidate must still get evaluated instead of
+   // being skipped straight to the price-action fallback.
+   if(bearIdx >= 0)
      {
       double entry  = rates[bearIdx].low;              // proximal edge for a short
       double stop   = rates[bearIdx].high + stopBuf;   // far edge of the OB
@@ -5116,7 +5228,10 @@ void DrawVolumeProfile(const long chart_id, const MqlRates &rates[], const ENUM_
    int poc = -1;
    double vah = 0.0, val = 0.0;
    if(!BuildVolumeProfile(rates, lastClosed, span, InpVPRows, vpLo, vpHi, vpVol, poc, vah, val))
+     {
+      g_vpPoc = 0.0; g_vpVah = 0.0; g_vpVal = 0.0;  // insufficient data — don't publish a stale prior read
       return;
+     }
    const datetime t0    = rates[lastClosed + 1 - span].time;
    const long     barSec= MathMax(60, PeriodSeconds(tf));
    double maxVol = 0.0;
@@ -5124,7 +5239,10 @@ void DrawVolumeProfile(const long chart_id, const MqlRates &rates[], const ENUM_
       if(vpVol[r0] > maxVol)
          maxVol = vpVol[r0];
    if(maxVol <= 0.0)
+     {
+      g_vpPoc = 0.0; g_vpVah = 0.0; g_vpVal = 0.0;
       return;
+     }
    for(int r0 = 0; r0 < ArraySize(vpVol); r0++)
      {
       if(vpVol[r0] <= 0.0)
@@ -5732,6 +5850,8 @@ void DrawICTPatterns(const long chart_id, const MqlRates &rates[], const SMarket
 bool UpsertDragLine(const long chart_id, const string name, const datetime t1, const datetime t2,
                     const double price, const color clr, const int width, const bool reanchor)
   {
+   if(g_drawSuppressed)
+      return(false);
    if(ObjectFind(chart_id, name) < 0)
      {
       if(!ObjectCreate(chart_id, name, OBJ_TREND, 0, t1, price, t2, price))
@@ -5851,11 +5971,14 @@ void RenderMasterScoreLabel(const long chart_id)
 //| suggestions, fractal alignment matrix, Monte Carlo read, correla-  |
 //| tion watch. Also refreshes the shared metric bus for this chart.   |
 //+------------------------------------------------------------------+
-void RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAMES tf,
-                     const SMarketState &st)
+int RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAMES tf,
+                    const SMarketState &st, const bool setupMuted)
   {
    int y = HUD_Y + ZEN_HUD_Y_OFF;
-   if(InpSelfHeal && g_setupMuted)
+   // v15.02: setupMuted is THIS chart's own self-heal read, passed in by the
+   // caller — g_setupMuted is the ATTACH chart's shared flag and previously
+   // leaked "SETUP MUTED" onto every other covered chart's HUD too.
+   if(InpSelfHeal && setupMuted)
      {
       UpsertLabel(chart_id, OBJ_PREFIX + "HUD_MUTED", HUD_X, y,
                   "SETUP MUTED (self-heal)", COL_STOP, HUD_FONT_ALERT, "Arial Bold",
@@ -5934,8 +6057,6 @@ void RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAME
                   CORNER_LEFT_UPPER);
       y += HUD_LINE_H;
      }
-   if(InpLeaderboard)
-      y += RenderLeaderboard(chart_id, y) * HUD_LINE_H;
    if(InpSessionCountdown)
      {
       string nextLbl = "";
@@ -5947,6 +6068,7 @@ void RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAME
          y += HUD_LINE_H;
         }
      }
+   return(y);
   }
 
 /* ================================================================== */
