@@ -108,8 +108,77 @@
 //+------------------------------------------------------------------+
 #property copyright "Chart Markup Key"
 #property link      ""
-#property version   "11.00"
+#property version   "15.00"
 #property description "Draws Price Action + ICT/SMC markup (thin lines / thin outline boxes) on every open chart."
+// v15.00 — THE COCKPIT SUMMARY (roadmap V15.00 — a top-down view across
+//         every covered chart, and a sense of session time remaining):
+//         1. Cross-chart leaderboard: as each covered chart renders, its
+//            Master Score + verdict + symbol are written into a shared
+//            registry (g_leader[]); the ATTACH chart draws a compact HUD
+//            block ranking the top InpLeaderboardRows charts by score —
+//            "1. XAUUSD GO 82  2. EURUSD WAIT 51  ...". Lets one attached
+//            EA answer "which of my open pairs looks best right now?"
+//            without switching charts. Toggle: InpLeaderboard.
+//         2. Session countdown: a HUD line naming the CLOSEST killzone
+//            transition (next open or the active session's close) and the
+//            remaining time, e.g. "NEXT: LONDON opens in 41m" or
+//            "NEXT: NY closes in 1h12m" — computed from server time
+//            against the existing Asia/London/NY hour inputs, independent
+//            of whether killzone shading itself is enabled. Toggle:
+//            InpSessionCountdown. Additive payload: leaderboard[], nextSession.
+// v14.00 — ADAPTIVE RISK (roadmap V14.00 — sizing and entry selection get
+//         smarter without any new auto-trading):
+//         1. Volatility regime read: current ATR vs. its own trailing
+//            InpVolRegimeBars-bar average classifies HIGH / NORMAL / LOW;
+//            HIGH scales a SUGGESTED risk % (InpVolHighCutMult× the
+//            current ATR ratio against InpRiskPercent, floored at
+//            InpVolMinRiskPercent) shown on the HUD next to the existing
+//            RISK line — "VOL HIGH (1.8x) - suggested risk 0.5%". Applying
+//            it stays manual (SET_RISK from the dashboard, same as v4.00)
+//            so a read-only suggestion never silently changes exposure.
+//            Toggle: InpVolRegime. Payload: volRegime, suggestedRiskPct.
+//         2. Best-of-N order-block selection: ComputeTradePlan no longer
+//            settles for the single newest unmitigated order block on
+//            each side — it scores up to InpPlanCandidates recent
+//            unmitigated OBs by ATR-normalized R:R to the nearest
+//            external-liquidity target and keeps the best, so a closer
+//            but poor-R:R OB no longer silently wins over a slightly
+//            older, better-aimed one. No behavior change when only one
+//            candidate exists.
+// v13.00 — PERFORMANCE ANALYTICS (roadmap V13.00 — the v5.00 trade journal
+//         finally gets read back, not just written):
+//         1. Win-rate / expectancy HUD: rescans each symbol's
+//            PAICT_TradeJournal_<symbol>.csv (InpStatsScanSec throttle,
+//            capped at InpStatsMaxRows most-recent rows) and shows
+//            "STATS 55% WIN - 0.32R EXP (42)" — win % and expectancy in
+//            R-multiples (profit / |entry-stop| priced via the row's own
+//            planEntry/planStop/planTarget columns), or stays silent with
+//            zero trades. Toggle: InpTradeStats. Payload: statsWinPct,
+//            statsExpectancyR, statsTrades.
+//         2. Equity mini-sparkline: a small normalized polyline of the
+//            journal's cumulative balanceAfter column, drawn top-right of
+//            the attach chart in a fixed pixel-mapped price band (reuses
+//            the v8.00 CVD polyline technique) — a running shape of
+//            "am I currently up or down" without opening the CSV.
+//            Toggle: InpEquitySpark.
+// v12.00 — SMART MONEY EXECUTION LAYER (roadmap V12.00 — two ICT
+//         refinements that read the state that already exists, no new
+//         detection primitives):
+//         1. Breaker blocks: an order block that gets mitigated (price
+//            trades through it) is checked for a hard displacement in the
+//            OPPOSITE direction on the very bar that broke it — if found,
+//            the box is redrawn as a dashed "breaker" in the flipped
+//            polarity color (a broken bullish OB that reverses hard
+//            becomes bearish resistance, and mirrored) instead of simply
+//            vanishing, tracking the classic ICT role-flip. Toggle:
+//            InpBreakerBlocks.
+//         2. Structure-shift warning: if a CHoCH against the ACTIVE
+//            plan's direction prints while price has not yet reached
+//            ENTRY, the plan's labels gain a "STRUCTURE SHIFT" tag instead
+//            of silently waiting to be hit or invalidated — the setup
+//            stays drawn (still a human call) but is flagged as
+//            contradicted by the newest structure. Toggle:
+//            InpStructureShiftTag. Payload: planShiftWarn.
 // v11.00 — THE 10x FEATURE DROP (three practical, low-risk additions on
 //         top of the v10.01 Zenith Terminal — all read-only markup, still
 //         zero auto-trading):
@@ -536,11 +605,13 @@
 #define COL_KZ_NY     C'6,182,212'    // cyan — New York killzone tint
 #define COL_OTE       C'196,181,253'  // v11.00: light violet — OTE Fibonacci pocket
 #define COL_DOPEN     C'226,232,240'  // v11.00: pale slate — daily / weekly open lines
+#define COL_BREAKER   C'244,63,94'    // v12.00: rose — breaker block (role-flipped OB)
+#define COL_SPARK     C'34,197,94'    // v13.00: green — equity sparkline (red when net down)
 
 #define OBJ_PREFIX    "PAICT_"
 #define IND_SHORTNAME "PAICT DualMA"
 #define GV_OWNER      "PAICT_ChartMarkup_Owner"
-#define PAICT_VERSION "11.00"  // single source of truth for journal output
+#define PAICT_VERSION "15.00"  // single source of truth for journal output
 
 /* ------------------------------------------------------------------ */
 /* v2.07 tuning constants — every formerly-hardcoded heuristic, named. */
@@ -640,6 +711,34 @@
 /* ------------------------------------------------------------------ */
 #define ALERT_TOL_ATR         0.10   // price-in-zone alert: ENTRY band tolerance × ATR
 #define ALERT_COOLDOWN_MIN_DEF 15    // default minutes between repeat alerts of one kind
+
+/* ------------------------------------------------------------------ */
+/* v12.00 execution-layer constants                                    */
+/* ------------------------------------------------------------------ */
+#define BREAKER_DISP_ATR      1.0    // breaker: opposite-direction body × ATR on the break bar
+
+/* ------------------------------------------------------------------ */
+/* v13.00 performance-analytics constants                              */
+/* ------------------------------------------------------------------ */
+#define STATS_SCAN_SEC_DEF    120    // trade-journal rescan interval (s)
+#define STATS_MAX_ROWS_DEF    500    // trade-journal: max recent rows read per scan
+#define SPARK_MAX_SEGMENTS    24     // equity sparkline polyline segments (cap)
+#define SPARK_WIDTH_BARS      20     // equity sparkline: pixel-mapped width (bars)
+#define SPARK_BAND_ATR        3.0    // equity sparkline: vertical band height × ATR
+
+/* ------------------------------------------------------------------ */
+/* v14.00 adaptive-risk constants                                      */
+/* ------------------------------------------------------------------ */
+#define VOL_REGIME_BARS_DEF   60     // ATR-vs-average window (bars)
+#define VOL_HIGH_RATIO        1.5    // ATR / avgATR ratio that reads as "HIGH" regime
+#define VOL_LOW_RATIO         0.7    // ATR / avgATR ratio that reads as "LOW" regime
+#define PLAN_CANDIDATES_DEF   3      // best-of-N unmitigated order blocks scored per side
+
+/* ------------------------------------------------------------------ */
+/* v15.00 cockpit-summary constants                                    */
+/* ------------------------------------------------------------------ */
+#define LEADERBOARD_ROWS_DEF  3      // leaderboard: rows shown on the HUD
+#define LEADERBOARD_FONT      9      // leaderboard: HUD font size
 
 /* ------------------------------------------------------------------ */
 /* Inputs                                                              */
@@ -771,6 +870,27 @@ input double InpOTEFibHigh        = 0.79;       // OTE zone far edge (fraction o
 input bool   InpDrawDayWeekOpens  = true;       // dotted daily / weekly open reference lines
 input bool   InpPriceAlerts       = true;       // SendNotification/Alert when price enters ENTRY/STOP/TARGET
 input int    InpAlertCooldownMin  = 15;         // minutes between repeat alerts of the same kind
+
+input group "Execution Layer (v12.00)"
+input bool   InpBreakerBlocks     = true;       // redraw a mitigated OB as a role-flipped breaker block
+input bool   InpStructureShiftTag = true;       // tag the plan "STRUCTURE SHIFT" on a counter-trend CHoCH
+
+input group "Performance Analytics (v13.00)"
+input bool   InpTradeStats        = true;       // win% / expectancy HUD from the trade journal CSV
+input int    InpStatsScanSec      = 120;        // journal rescan interval (s)
+input int    InpStatsMaxRows      = 500;        // max recent journal rows read per scan
+input bool   InpEquitySpark       = true;       // equity mini-sparkline from the journal balance column
+
+input group "Adaptive Risk (v14.00)"
+input bool   InpVolRegime         = true;       // ATR-vs-average volatility regime + suggested risk %
+input int    InpVolRegimeBars     = 60;         // trailing window for the ATR average (bars)
+input double InpVolMinRiskPercent = 0.25;       // floor for the suggested risk % in a HIGH regime
+input int    InpPlanCandidates    = 3;          // best-of-N unmitigated order blocks scored per side
+
+input group "Cockpit Summary (v15.00)"
+input bool   InpLeaderboard       = true;       // cross-chart Master Score leaderboard on the HUD
+input int    InpLeaderboardRows   = 3;          // leaderboard rows shown
+input bool   InpSessionCountdown  = true;       // "NEXT: LONDON opens in 41m" HUD line
 
 input group "Style"
 input int    InpExtendRightBars = 8;             // Right-edge extension of boxes
@@ -940,6 +1060,12 @@ struct SZenSnap
    bool   oteBullish; // v11.00: OTE zone direction
    double dOpen;      // v11.00: today's D1 open
    double wOpen;       // v11.00: this week's W1 open
+   bool   planShiftWarn;     // v12.00: active plan contradicted by a fresher CHoCH
+   string volRegime;         // v14.00: HIGH / NORMAL / LOW
+   double suggestedRiskPct;  // v14.00: scaled-down risk % suggestion
+   double statsWinPct;       // v13.00: journal win rate %
+   double statsExpectancyR;  // v13.00: journal expectancy in R-multiples
+   int    statsTrades;       // v13.00: journal trade count used
   };
 SZenSnap g_zen;
 
@@ -947,6 +1073,26 @@ SZenSnap g_zen;
 // throttled so watching several pairs does not spam mobile push.
 string   g_lastAlertKind  = "";
 datetime g_lastAlertTime  = 0;
+
+/* ------------------------------------------------------------------ */
+/* v13.00 performance analytics state                                  */
+/* ------------------------------------------------------------------ */
+datetime g_statsScan       = 0;      // journal rescan throttle
+double   g_statsWinPct     = 0.0;
+double   g_statsExpR       = 0.0;
+int      g_statsTrades     = 0;
+double   g_statsBalances[];          // cumulative balanceAfter series for the sparkline
+
+/* ------------------------------------------------------------------ */
+/* v15.00 cross-chart leaderboard                                      */
+/* ------------------------------------------------------------------ */
+struct SLeaderRow
+  {
+   string symbol;
+   int    score;
+   string verdict;
+  };
+SLeaderRow g_leader[];   // one row per covered chart, refreshed as each renders
 
 // v10.01 hotfix: SMarketState moved ABOVE its first use — SelfHealUpdate()
 // takes one, and MQL5 requires a type to be declared before the first
@@ -1012,6 +1158,18 @@ struct SMarketState
    datetime         dOpenT;
    double           wOpen;
    datetime         wOpenT;
+   // v12.00: breaker block (a mitigated OB that flipped polarity)
+   bool             breakerOk;
+   bool             breakerWasBull;   // the ORIGINAL order block's side before the flip
+   double           breakerLo;
+   double           breakerHi;
+   datetime         breakerT1;
+   // v12.00: active plan contradicted by a fresher counter-trend CHoCH
+   bool             planShiftWarn;
+   // v14.00: volatility regime + suggested risk
+   string           volRegime;        // "HIGH" / "NORMAL" / "LOW"
+   double           volRatio;         // ATR / trailing average ATR
+   double           suggestedRiskPct; // scaled-down risk % suggestion (HIGH regime only)
   };
 
 /* ------------------------------------------------------------------ */
@@ -1104,6 +1262,14 @@ int OnInit()
          " · day/week opens ", (InpDrawDayWeekOpens ? "on" : "off"),
          " · price alerts ", (InpPriceAlerts ? "on" : "off"),
          " (cooldown ", MathMax(1, InpAlertCooldownMin), "m)");
+   Print("PAICT v12-v15: breaker blocks ", (InpBreakerBlocks ? "on" : "off"),
+         " · structure-shift tag ", (InpStructureShiftTag ? "on" : "off"),
+         " · trade stats ", (InpTradeStats ? "on" : "off"),
+         " · equity spark ", (InpEquitySpark ? "on" : "off"),
+         " · vol regime ", (InpVolRegime ? "on" : "off"),
+         " (plan candidates ", MathMax(1, InpPlanCandidates), ")",
+         " · leaderboard ", (InpLeaderboard ? "on" : "off"),
+         " · session countdown ", (InpSessionCountdown ? "on" : "off"));
    PushMatrixToBridge();
    return(INIT_SUCCEEDED);
   }
@@ -1166,6 +1332,7 @@ void OnTimer()
    RefreshAll();
    ScanNews();             // v4.00: economic-calendar cache (internally throttled)
    ScanTunerFile();        // v5.00: local tuner suggestions (internally throttled)
+   ScanTradeStats();       // v13.00: trade-journal win%/expectancy (internally throttled)
    PushMatrixToBridge();   // re-push whenever the plan values changed (deduped)
    CheckPriceAlerts();     // v11.00: price-in-zone push alerts (internally throttled)
   }
@@ -1460,6 +1627,143 @@ void ScanTunerFile()
    ForceFullRedraw();
   }
 
+/* ================================================================== */
+/* v13.00 PERFORMANCE ANALYTICS — read back the v5.00 trade journal    */
+/* (win rate, expectancy in R-multiples, an equity mini-sparkline).    */
+/* Scoped to the ATTACH chart's own symbol journal, same as g_plan.    */
+/* ================================================================== */
+
+//+------------------------------------------------------------------+
+//| Rescan MQL5\Files\PAICT_TradeJournal_<attach symbol>.csv (throttled |
+//| to InpStatsScanSec) and recompute win% / expectancy(R) / the        |
+//| cumulative-balance series the sparkline draws from. Expectancy      |
+//| approximates each trade's risk in money from ITS OWN planEntry/     |
+//| planStop columns priced at CURRENT tick size/value — a comparison   |
+//| statistic, like every other simplified metric in this EA, not a     |
+//| certified backtest number.                                          |
+//+------------------------------------------------------------------+
+void ScanTradeStats()
+  {
+   if(!InpTradeStats && !InpEquitySpark)
+      return;
+   if(g_statsScan != 0 && TimeCurrent() - g_statsScan < MathMax(10, InpStatsScanSec))
+      return;
+   g_statsScan = TimeCurrent();
+
+   const string fname = "PAICT_TradeJournal_" + _Symbol + ".csv";
+   ResetLastError();
+   const int h = FileOpen(fname, FILE_READ|FILE_CSV|FILE_ANSI|FILE_SHARE_READ|FILE_SHARE_WRITE, ',');
+   if(h == INVALID_HANDLE)
+     {
+      g_statsWinPct = 0.0;
+      g_statsExpR   = 0.0;
+      g_statsTrades = 0;
+      ArrayResize(g_statsBalances, 0, ARRAY_RESERVE_CHUNK);
+      return;                      // no journal yet — silent, no trades closed
+     }
+
+   for(int k = 0; k < 11 && !FileIsEnding(h); k++)
+      FileReadString(h);          // skip the 11 header fields
+
+   double balances[];
+   int    wins = 0;
+   int    trades = 0;
+   double sumR = 0.0;
+   int    rCount = 0;
+   const int maxRows = MathMax(1, InpStatsMaxRows);
+
+   while(!FileIsEnding(h) && trades < maxRows)
+     {
+      const string sTime = FileReadString(h);
+      if(sTime == "" && FileIsEnding(h))
+         break;
+      const string sSym      = FileReadString(h);
+      FileReadString(h);                          // side (unused here)
+      const double vol       = StringToDouble(FileReadString(h));
+      FileReadString(h);                          // closePrice (unused here)
+      const double profit    = StringToDouble(FileReadString(h));
+      const double balAfter  = StringToDouble(FileReadString(h));
+      const double pe        = StringToDouble(FileReadString(h));
+      const double ps        = StringToDouble(FileReadString(h));
+      FileReadString(h);                          // planTarget (unused here)
+      FileReadString(h);                          // planRR (unused here)
+
+      trades++;
+      if(profit > 0.0)
+         wins++;
+      const int at = ArraySize(balances);
+      ArrayResize(balances, at + 1, ARRAY_RESERVE_CHUNK);
+      balances[at] = balAfter;
+
+      if(pe != 0.0 && ps != 0.0 && vol > 0.0)
+        {
+         const double tickSize  = SymbolInfoDouble(sSym, SYMBOL_TRADE_TICK_SIZE);
+         const double tickValue = SymbolInfoDouble(sSym, SYMBOL_TRADE_TICK_VALUE);
+         if(tickSize > 0.0 && tickValue > 0.0)
+           {
+            const double riskMoney = MathAbs(pe - ps) / tickSize * tickValue * vol;
+            if(riskMoney > 0.0)
+              {
+               sumR += profit / riskMoney;
+               rCount++;
+              }
+           }
+        }
+     }
+   FileClose(h);
+
+   g_statsTrades = trades;
+   g_statsWinPct = (trades > 0) ? 100.0 * wins / trades : 0.0;
+   g_statsExpR   = (rCount > 0) ? sumR / rCount : 0.0;
+   ArrayResize(g_statsBalances, ArraySize(balances), ARRAY_RESERVE_CHUNK);
+   for(int i = 0; i < ArraySize(balances); i++)
+      g_statsBalances[i] = balances[i];
+  }
+
+//+------------------------------------------------------------------+
+//| Equity mini-sparkline: a normalized polyline of the cumulative      |
+//| balanceAfter series, anchored above price near the right edge —     |
+//| reuses the v8.00 CVD polyline technique (price/time chart objects,  |
+//| not literal screen pixels, so it scales with zoom like everything   |
+//| else this EA draws).                                                |
+//+------------------------------------------------------------------+
+void DrawEquitySpark(const long chart_id, const MqlRates &rates[], const int lastClosed,
+                     const ENUM_TIMEFRAMES tf, const double atr, const double closeRef)
+  {
+   const int n = ArraySize(g_statsBalances);
+   if(n < 2 || atr <= 0.0)
+      return;
+   const int take = MathMin(n, SPARK_MAX_SEGMENTS + 1);
+   const int i0   = n - take;
+   double mn = DBL_MAX, mx = -DBL_MAX;
+   for(int i = i0; i < n; i++)
+     {
+      if(g_statsBalances[i] < mn) mn = g_statsBalances[i];
+      if(g_statsBalances[i] > mx) mx = g_statsBalances[i];
+     }
+   if(mx - mn <= 0.0)
+      return;
+
+   const double   base   = closeRef + atr * (SPARK_BAND_ATR - 1.0);
+   const double   band   = atr;
+   const long     barSec = MathMax(60, PeriodSeconds(tf));
+   const datetime t0     = (datetime)((long)rates[lastClosed].time - (long)SPARK_WIDTH_BARS * barSec);
+   const int      steps  = take - 1;
+   const color    clr    = (g_statsBalances[n - 1] >= g_statsBalances[i0]) ? COL_SPARK : COL_STOP;
+
+   for(int k = 0; k < steps; k++)
+     {
+      const double y0 = base + band * (g_statsBalances[i0 + k]     - mn) / (mx - mn);
+      const double y1 = base + band * (g_statsBalances[i0 + k + 1] - mn) / (mx - mn);
+      const datetime x0 = (datetime)((long)t0 + (long)((double)k       / steps * SPARK_WIDTH_BARS) * barSec);
+      const datetime x1 = (datetime)((long)t0 + (long)((double)(k + 1) / steps * SPARK_WIDTH_BARS) * barSec);
+      UpsertSegment(chart_id, OBJ_PREFIX + "SPARK_" + IntegerToString(k), x0, y0, x1, y1, clr, 1, STYLE_SOLID);
+     }
+   if(InpShowLabels)
+      UpsertText(chart_id, OBJ_PREFIX + "SPARK_LBL", t0, base + band,
+                 "EQUITY", clr, 8, "Arial", ANCHOR_LEFT_LOWER);
+  }
+
 //+------------------------------------------------------------------+
 //| v10.00 sandbox: a line was dragged — read the new levels back.     |
 //| Chart events only fire for the EA's OWN chart, which is exactly    |
@@ -1514,6 +1818,7 @@ void RefreshAll()
      }
    PruneChartStates();
    PruneIndicatorPairs();
+   PruneLeaderboard();      // v15.00: drop rows for charts no longer covered
   }
 
 //+------------------------------------------------------------------+
@@ -1732,6 +2037,57 @@ double GetAtr(const string symbol, const ENUM_TIMEFRAMES tf)
       result = ManualAtr(symbol, tf, MathMax(2, InpATRPeriod));
      }
    return(result);
+  }
+
+//+------------------------------------------------------------------+
+//| v14.00: trailing average of the ATR indicator's own readings over   |
+//| `bars` closed bars — the baseline the current ATR is compared      |
+//| against for the HIGH / NORMAL / LOW volatility regime read.        |
+//+------------------------------------------------------------------+
+double GetAtrAverage(const string symbol, const ENUM_TIMEFRAMES tf, const int bars)
+  {
+   int h = iATR(symbol, tf, MathMax(2, InpATRPeriod));
+   if(h == INVALID_HANDLE)
+      return(0.0);
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   const int need = MathMax(5, bars);
+   ResetLastError();
+   if(CopyBuffer(h, 0, 1, need, buf) < need)
+     {
+      IndicatorRelease(h);
+      return(0.0);
+     }
+   double sum = 0.0;
+   for(int i = 0; i < need; i++)
+      sum += buf[i];
+   IndicatorRelease(h);
+   return(sum / need);
+  }
+
+//+------------------------------------------------------------------+
+//| v14.00: classify the current ATR against its trailing average into  |
+//| HIGH / NORMAL / LOW, and — only in a HIGH regime — suggest a        |
+//| scaled-down risk % (never applied automatically; SET_RISK from the |
+//| dashboard, exactly like the v4.00 risk override, stays the only    |
+//| way it actually changes sizing).                                    |
+//+------------------------------------------------------------------+
+void ComputeVolRegime(const double atr, const double atrAvg, const double riskPct,
+                      string &regime, double &ratio, double &suggestedRiskPct)
+  {
+   regime = "NORMAL";
+   ratio  = 0.0;
+   suggestedRiskPct = 0.0;
+   if(atrAvg <= 0.0 || atr <= 0.0)
+      return;
+   ratio = atr / atrAvg;
+   if(ratio >= VOL_HIGH_RATIO)
+     {
+      regime = "HIGH";
+      suggestedRiskPct = MathMax(InpVolMinRiskPercent, riskPct / ratio);
+     }
+   else if(ratio <= VOL_LOW_RATIO)
+      regime = "LOW";
   }
 
 //+------------------------------------------------------------------+
@@ -2304,6 +2660,15 @@ void MarketStateReset(SMarketState &st)
    st.dOpenT     = 0;
    st.wOpen      = 0.0;
    st.wOpenT     = 0;
+   st.breakerOk       = false;
+   st.breakerWasBull  = false;
+   st.breakerLo       = 0.0;
+   st.breakerHi       = 0.0;
+   st.breakerT1       = 0;
+   st.planShiftWarn   = false;
+   st.volRegime       = "";
+   st.volRatio        = 0.0;
+   st.suggestedRiskPct = 0.0;
   }
 
 // Attach chart's latest plan — the Web Bridge reads THIS (v2.07: no more
@@ -2390,8 +2755,18 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
    const double dThr = st.atr * InpDisplacementATR;
    if(InpDrawICT && dThr > 0.0)
      {
-      st.bullIdx = FindOrderBlock(rates, st.lastClosed, dThr, true);
-      st.bearIdx = FindOrderBlock(rates, st.lastClosed, dThr, false);
+      // v14.00: best-of-N unmitigated order blocks, scored by ATR-normalized
+      // R:R to the nearest external-liquidity target, instead of always the
+      // single newest one — InpPlanCandidates=1 recovers the old behavior.
+      int bullCands[];
+      int bearCands[];
+      const int maxCand = MathMax(1, InpPlanCandidates);
+      FindOrderBlockCandidates(rates, st.lastClosed, dThr, true,  bullCands, maxCand);
+      FindOrderBlockCandidates(rates, st.lastClosed, dThr, false, bearCands, maxCand);
+      st.bullIdx = PickBestOB(rates, bullCands, ArraySize(bullCands), true,
+                              st.hiIdx, st.hiVal, st.nHi, st.loIdx, st.loVal, st.nLo, st.atr);
+      st.bearIdx = PickBestOB(rates, bearCands, ArraySize(bearCands), false,
+                              st.hiIdx, st.hiVal, st.nHi, st.loIdx, st.loVal, st.nLo, st.atr);
 
       if(InpDrawFVG)
          st.fvgCount = FindFVGs(rates, st.lastClosed, dThr,
@@ -2403,16 +2778,29 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
                                               st.loIdx, st.loVal, st.nLo,
                                               st.chocIdx, st.chocLvl,
                                               st.mssIdx, st.mssLvl);
+
+      // v12.00: a mitigated OB that reversed hard becomes a breaker block.
+      if(InpBreakerBlocks)
+         st.breakerOk = FindBreakerBlock(rates, st.lastClosed, dThr, st.atr,
+                                         st.breakerWasBull, st.breakerLo, st.breakerHi, st.breakerT1);
      }
 
    /* --------------------------- Trade Plan ----------------------- */
    if(InpDrawPlan && st.atr > 0.0)
+     {
       st.planOk = ComputeTradePlan(rates, st.lastClosed, st.closeRef, st.atr,
                                    st.hiIdx, st.hiVal, st.nHi, st.loIdx, st.loVal, st.nLo,
                                    st.bullIdx, st.bearIdx,
                                    st.supply, ArraySize(st.supply),
                                    st.demand, ArraySize(st.demand),
                                    st.planEntry, st.planStop, st.planTarget);
+
+      // v12.00: a fresher counter-trend CHoCH/MSS while price hasn't yet
+      // reached ENTRY flags the plan instead of leaving it silently stale.
+      if(st.planOk && InpStructureShiftTag)
+         st.planShiftWarn = DetectStructureShift(st.lastClosed, st.chocIdx, st.mssIdx,
+                                                 st.closeRef, st.planEntry, st.planTarget);
+     }
 
    /* --------------------------- v11.00: OTE pocket ----------------- */
    if(InpDrawOTE)
@@ -2422,6 +2810,13 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
    /* --------------------- v11.00: daily / weekly opens ------------- */
    if(InpDrawDayWeekOpens)
       ComputeDayWeekOpens(symbol, st.dOpen, st.dOpenT, st.wOpen, st.wOpenT);
+
+   /* --------------------- v14.00: volatility regime ----------------- */
+   if(InpVolRegime && st.atr > 0.0)
+     {
+      const double atrAvg = GetAtrAverage(symbol, tf, MathMax(5, InpVolRegimeBars));
+      ComputeVolRegime(st.atr, atrAvg, g_ov.riskPct, st.volRegime, st.volRatio, st.suggestedRiskPct);
+     }
 
    st.ok = true;
    return(true);
@@ -2521,6 +2916,11 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
                        COL_STRUCT, STYLE_DASH, 2, "MSS/BOS");
      }
 
+   /* --------------------------- v12.00: breaker block --------------- */
+   if(InpBreakerBlocks && st.breakerOk)
+      DrawBreakerBlock(chart_id, rates, st.tf, st.lastClosed, st.closeRef,
+                       st.breakerT1, st.breakerLo, st.breakerHi, st.breakerWasBull);
+
    /* --------------------- HTF overlay (dimmed, labelled) --------- */
    int htfDrawn = 0;
    if(InpDrawHTF)
@@ -2529,7 +2929,8 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
    /* --------------------------- Trade Plan ----------------------- */
    if(st.planOk)
       RenderTradePlan(chart_id, rates, st.tf, st.lastClosed, st.closeRef,
-                      st.planEntry, st.planStop, st.planTarget, blackout);
+                      st.planEntry, st.planStop, st.planTarget, blackout,
+                      InpStructureShiftTag && st.planShiftWarn);
 
    /* --------------------- co-pilot HUD (v4.00) -------------------- */
    if(InpRiskHUD || InpHeatTracker)
@@ -2555,6 +2956,8 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       DrawDOMStrip(chart_id, st.symbol, st.tf);
    if(InpSandbox && g_ov.sandbox)
       RenderSandbox(chart_id, rates, st.lastClosed, st.tf, st);
+   if(InpEquitySpark && chart_id == ChartID())
+      DrawEquitySpark(chart_id, rates, st.lastClosed, st.tf, st.atr, st.closeRef);
    if(InpMasterScore)
      {
       g_masterScore = ComputeMasterScore(st);
@@ -2565,6 +2968,10 @@ int RenderMarketState(const long chart_id, const MqlRates &rates[], const SMarke
       else
          g_masterVerdict = "";
       RenderMasterScoreLabel(chart_id);
+      // v15.00: feed this chart's read into the cross-chart leaderboard —
+      // the globals above hold THIS chart's numbers right now.
+      if(InpLeaderboard)
+         UpdateLeaderboard(st.symbol, g_masterScore, g_masterVerdict);
      }
 
    SweepUndrawn(chart_id);
@@ -2642,6 +3049,13 @@ void DrawOnChart(const long chart_id, const string symbol, const ENUM_TIMEFRAMES
       g_zen.oteBullish = st.oteBullish;
       g_zen.dOpen      = st.dOpen;
       g_zen.wOpen      = st.wOpen;
+      // v12.00 / v13.00 / v14.00: execution layer, journal stats, adaptive risk
+      g_zen.planShiftWarn    = st.planShiftWarn;
+      g_zen.volRegime        = st.volRegime;
+      g_zen.suggestedRiskPct = st.suggestedRiskPct;
+      g_zen.statsWinPct      = g_statsWinPct;
+      g_zen.statsExpectancyR = g_statsExpR;
+      g_zen.statsTrades      = g_statsTrades;
      }
 
    /* --------------------- JSON export hook (opt-in) --------------- */
@@ -3202,6 +3616,198 @@ int FindOrderBlock(const MqlRates &rates[], const int lastClosed, const double d
       return(i); // newest unmitigated order block wins
      }
    return(-1);
+  }
+
+/* ------------------------------------------------------------------ */
+/* v14.00: best-of-N order-block selection (PURE)                      */
+/*                                                                      */
+/* FindOrderBlockCandidates mirrors FindOrderBlock's scan but collects  */
+/* up to maxN unmitigated candidates (newest first) instead of          */
+/* returning on the first hit. PickBestOB then scores each candidate    */
+/* by its R:R to the nearest external-liquidity target and keeps the    */
+/* best — InpPlanCandidates=1 collapses back to the old "newest wins"   */
+/* behavior exactly.                                                    */
+/* ------------------------------------------------------------------ */
+int FindOrderBlockCandidates(const MqlRates &rates[], const int lastClosed, const double dThr,
+                             const bool bullish, int &out[], const int maxN)
+  {
+   ArrayResize(out, 0);
+   int start = lastClosed - MathMin(lastClosed - 3, InpICTLookback);
+   if(start < 2)
+      start = 2;
+
+   for(int i = lastClosed - 2; i >= start && ArraySize(out) < MathMax(1, maxN); i--)
+     {
+      bool obColorOk = bullish ? (rates[i].close < rates[i].open)
+                               : (rates[i].close > rates[i].open);
+      if(!obColorOk)
+         continue;
+
+      double bodyNext = rates[i + 1].close - rates[i + 1].open;
+      bool displaced  = bullish ? (bodyNext >= dThr) : (-bodyNext >= dThr);
+      if(!displaced)
+         continue;
+
+      bool cleared = bullish
+                     ? (rates[i + 1].close > rates[i].high || (i + 2 <= lastClosed && rates[i + 2].high > rates[i].high))
+                     : (rates[i + 1].close < rates[i].low  || (i + 2 <= lastClosed && rates[i + 2].low  < rates[i].low));
+      if(!cleared)
+         continue;
+
+      bool mitigated = false;
+      for(int m = i + 2; m <= lastClosed; m++)
+        {
+         if(bullish && rates[m].low < rates[i].low)   { mitigated = true; break; }
+         if(!bullish && rates[m].high > rates[i].high) { mitigated = true; break; }
+        }
+      if(mitigated)
+         continue;
+
+      const int at = ArraySize(out);
+      ArrayResize(out, at + 1, ARRAY_RESERVE_CHUNK);
+      out[at] = i;
+     }
+   return(ArraySize(out));
+  }
+
+int PickBestOB(const MqlRates &rates[], const int &cands[], const int nCands, const bool bullish,
+              const int &hiIdx[], const double &hiVal[], const int nHi,
+              const int &loIdx[], const double &loVal[], const int nLo,
+              const double atr)
+  {
+   if(nCands <= 0)
+      return(-1);
+   int    best      = cands[0];        // newest candidate is the fallback
+   double bestScore = -1.0;
+   const double stopBuf = atr * PLAN_STOP_BUF_ATR;
+
+   for(int c = 0; c < nCands; c++)
+     {
+      const int i = cands[c];
+      double entry, stop, target;
+      bool   ok = false;
+      if(bullish)
+        {
+         entry = rates[i].high;
+         stop  = rates[i].low - stopBuf;
+         for(int s = nHi - 1; s >= 0; s--)
+            if(hiVal[s] > entry) { target = hiVal[s]; ok = true; break; }
+        }
+      else
+        {
+         entry = rates[i].low;
+         stop  = rates[i].high + stopBuf;
+         for(int s = nLo - 1; s >= 0; s--)
+            if(loVal[s] < entry) { target = loVal[s]; ok = true; break; }
+        }
+      if(!ok)
+         continue;
+      const double risk = MathAbs(entry - stop);
+      if(risk <= 0.0)
+         continue;
+      const double rr = MathAbs(target - entry) / risk;
+      if(rr > bestScore)
+        {
+         bestScore = rr;
+         best      = i;
+        }
+     }
+   return(best);
+  }
+
+/* ------------------------------------------------------------------ */
+/* v12.00: breaker blocks (PURE) — the newest OB candidate (either      */
+/* side) that WAS mitigated is checked for a hard opposite-direction    */
+/* displacement on the bar that broke it; if found, it is reported as   */
+/* a role-flipped breaker instead of just vanishing.                    */
+/* ------------------------------------------------------------------ */
+bool FindBreakerBlock(const MqlRates &rates[], const int lastClosed, const double dThr,
+                      const double atr, bool &wasBull, double &lo, double &hi, datetime &t1)
+  {
+   wasBull = false;
+   lo = 0.0;
+   hi = 0.0;
+   t1 = 0;
+   if(atr <= 0.0)
+      return(false);
+
+   int start = lastClosed - MathMin(lastClosed - 3, InpICTLookback);
+   if(start < 2)
+      start = 2;
+
+   for(int i = lastClosed - 2; i >= start; i--)
+     {
+      for(int side = 0; side < 2; side++)
+        {
+         const bool bullish = (side == 0);
+         bool obColorOk = bullish ? (rates[i].close < rates[i].open)
+                                  : (rates[i].close > rates[i].open);
+         if(!obColorOk)
+            continue;
+
+         double bodyNext = rates[i + 1].close - rates[i + 1].open;
+         bool displaced  = bullish ? (bodyNext >= dThr) : (-bodyNext >= dThr);
+         if(!displaced)
+            continue;
+
+         bool cleared = bullish
+                        ? (rates[i + 1].close > rates[i].high || (i + 2 <= lastClosed && rates[i + 2].high > rates[i].high))
+                        : (rates[i + 1].close < rates[i].low  || (i + 2 <= lastClosed && rates[i + 2].low  < rates[i].low));
+         if(!cleared)
+            continue;
+
+         int mitBar = -1;
+         for(int m = i + 2; m <= lastClosed; m++)
+           {
+            if(bullish && rates[m].low < rates[i].low)    { mitBar = m; break; }
+            if(!bullish && rates[m].high > rates[i].high) { mitBar = m; break; }
+           }
+         if(mitBar < 0)
+            continue;                     // still a live, unmitigated OB — not a breaker
+
+         const double mitBody = rates[mitBar].close - rates[mitBar].open;
+         const bool   flipped = bullish ? (-mitBody >= BREAKER_DISP_ATR * atr)
+                                        : ( mitBody >= BREAKER_DISP_ATR * atr);
+         if(!flipped)
+            continue;
+
+         wasBull = bullish;
+         lo = rates[i].low;
+         hi = rates[i].high;
+         t1 = rates[i].time;
+         return(true);                    // newest breaker wins
+        }
+     }
+   return(false);
+  }
+
+/* ------------------------------------------------------------------ */
+/* v12.00: structure-shift warning (PURE) — a fresh counter-trend       */
+/* CHoCH/MSS while price has not yet reached ENTRY contradicts the      */
+/* active plan without invalidating it outright (self-heal still owns  */
+/* that call once STOP is actually hit).                                */
+/* ------------------------------------------------------------------ */
+bool DetectStructureShift(const int lastClosed, const int chocIdx, const int mssIdx,
+                          const double closeRef, const double planEntry, const double planTarget)
+  {
+   const bool isLong = (planTarget > planEntry);
+   const int  freshWindow = STRUCT_DASH_CTX * 3;
+
+   if(isLong)
+     {
+      // waiting for price to pull back down into ENTRY; a fresh bearish
+      // low-break (chocIdx) while price is still above ENTRY contradicts it.
+      if(chocIdx >= 0 && closeRef > planEntry && lastClosed - chocIdx <= freshWindow)
+         return(true);
+     }
+   else
+     {
+      // waiting for price to rally up into ENTRY; a fresh bullish
+      // high-break (mssIdx) while price is still below ENTRY contradicts it.
+      if(mssIdx >= 0 && closeRef < planEntry && lastClosed - mssIdx <= freshWindow)
+         return(true);
+     }
+   return(false);
   }
 
 void DrawOrderBlock(const long chart_id, const MqlRates &rates[], const ENUM_TIMEFRAMES tf,
@@ -3887,6 +4493,26 @@ void WriteChartJSON(const SMarketState &st, const MqlRates &rates[])
    w.AddRaw("dOpen", JNum(st.dOpen, digits));
    w.AddRaw("wOpen", JNum(st.wOpen, digits));
 
+   // v12.00 / v14.00 additive fields
+   string breaker = "null";
+   if(st.breakerOk)
+     {
+      CJsonWriter b;
+      b.AddNum("low", st.breakerLo, digits);
+      b.AddNum("high", st.breakerHi, digits);
+      b.AddRaw("wasBullish", st.breakerWasBull ? "true" : "false");
+      breaker = b.Build();
+     }
+   w.AddRaw("breaker", breaker);
+   w.AddRaw("planShiftWarn", st.planShiftWarn ? "true" : "false");
+   if(st.volRegime != "")
+     {
+      w.Add("volRegime", st.volRegime);
+      w.AddNum("volRatio", st.volRatio, 2);
+      if(st.suggestedRiskPct > 0.0)
+         w.AddNum("suggestedRiskPct", st.suggestedRiskPct, 2);
+     }
+
    string json = w.Build();
 
    string fname = "PAICT_" + st.symbol + "_" + tfName + ".json";
@@ -4057,12 +4683,43 @@ bool ComputeTradePlan(const MqlRates &rates[], const int lastClosed,
 void RenderTradePlan(const long chart_id, const MqlRates &rates[], const ENUM_TIMEFRAMES tf,
                      const int lastClosed, const double closeRef,
                      const double entry, const double stop, const double target,
-                     const bool washout)
+                     const bool washout, const bool shiftWarn)
   {
    DrawPlanLine(chart_id, rates, tf, lastClosed, entry,  closeRef, COL_ENTRY,  "ENTRY",  "ENTRY",  washout);
    DrawPlanLine(chart_id, rates, tf, lastClosed, target, closeRef, COL_TARGET, "TARGET", "TARGET", washout);
    DrawPlanLine(chart_id, rates, tf, lastClosed, stop,   closeRef, COL_STOP,   "STOP",   "STOP",   washout);
    DrawPlanRR(chart_id, rates, tf, lastClosed, entry, target, stop, closeRef);
+
+   // v12.00: a fresh counter-trend CHoCH/MSS before ENTRY was reached —
+   // the plan stays drawn (still a human call) but gets flagged.
+   if(shiftWarn && InpShowLabels)
+     {
+      const datetime t1 = (datetime)(rates[lastClosed].time +
+                                     (long)PeriodSeconds(tf) * MathMax(1, InpExtendRightBars));
+      UpsertText(chart_id, OBJ_PREFIX + "PLAN_SHIFT", t1, entry,
+                 "STRUCTURE SHIFT", COL_CHOCH, 8, "Arial Bold",
+                 entry >= closeRef ? ANCHOR_RIGHT_LOWER : ANCHOR_RIGHT_UPPER);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| v12.00: draw a breaker block — the same rectangle style as a live   |
+//| order block, but dashed and in the flipped-role color so it reads  |
+//| distinctly ("this used to be support, it's resistance now").       |
+//+------------------------------------------------------------------+
+void DrawBreakerBlock(const long chart_id, const MqlRates &rates[], const ENUM_TIMEFRAMES tf,
+                      const int lastClosed, const double closeRef,
+                      const datetime t1, const double lo, const double hi, const bool wasBull)
+  {
+   const datetime t2 = (datetime)(rates[lastClosed].time +
+                                  (long)PeriodSeconds(tf) * MathMax(1, InpExtendRightBars));
+   UpsertRect(chart_id, OBJ_PREFIX + "BREAKER", t1, lo, t2, hi,
+              COL_BREAKER, false, false, STYLE_DASH);
+   if(InpShowLabels)
+      UpsertText(chart_id, OBJ_PREFIX + "BREAKER_LBL", t1, wasBull ? lo : hi,
+                 wasBull ? "breaker (was bull OB)" : "breaker (was bear OB)",
+                 COL_BREAKER, 8, "Arial",
+                 (wasBull ? lo : hi) >= closeRef ? ANCHOR_LEFT_LOWER : ANCHOR_LEFT_UPPER);
   }
 
 //+------------------------------------------------------------------+
@@ -5131,6 +5788,186 @@ void RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAME
       RenderCorrelation(chart_id, sym, tf, y, st);
       y += HUD_LINE_H;
      }
+   if(InpTradeStats && chart_id == ChartID() && g_statsTrades > 0)
+     {
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_STATS", HUD_X, y,
+                  "STATS " + DoubleToString(g_statsWinPct, 0) + "% WIN · " +
+                  DoubleToString(g_statsExpR, 2) + "R EXP (" +
+                  IntegerToString(g_statsTrades) + ")",
+                  (g_statsExpR >= 0.0 ? COL_TARGET : COL_STOP), HUD_FONT, "Arial",
+                  CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
+     }
+   if(InpVolRegime && st.volRegime != "")
+     {
+      const color vc = (st.volRegime == "HIGH") ? COL_KZ_LON :
+                       (st.volRegime == "LOW" ? COL_LIQ : COL_TARGET);
+      string txt = "VOL " + st.volRegime + " (" + DoubleToString(st.volRatio, 1) + "x)";
+      if(st.volRegime == "HIGH" && st.suggestedRiskPct > 0.0)
+         txt += " · suggested risk " + DoubleToString(st.suggestedRiskPct, 2) + "%";
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_VOL", HUD_X, y, txt, vc, HUD_FONT, "Arial",
+                  CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
+     }
+   if(InpLeaderboard)
+      y += RenderLeaderboard(chart_id, y) * HUD_LINE_H;
+   if(InpSessionCountdown)
+     {
+      string nextLbl = "";
+      ComputeSessionCountdown(nextLbl);
+      if(nextLbl != "")
+        {
+         UpsertLabel(chart_id, OBJ_PREFIX + "HUD_NEXT", HUD_X, y, nextLbl, COL_LIQ,
+                     HUD_FONT, "Arial", CORNER_LEFT_UPPER);
+         y += HUD_LINE_H;
+        }
+     }
+  }
+
+/* ================================================================== */
+/* v15.00 COCKPIT SUMMARY — cross-chart leaderboard + session countdown */
+/* ================================================================== */
+int LeaderIndex(const string sym, const bool create)
+  {
+   for(int i = 0; i < ArraySize(g_leader); i++)
+      if(g_leader[i].symbol == sym)
+         return(i);
+   if(!create)
+      return(-1);
+   const int at = ArraySize(g_leader);
+   ArrayResize(g_leader, at + 1, ARRAY_RESERVE_CHUNK);
+   g_leader[at].symbol  = sym;
+   g_leader[at].score   = -1;
+   g_leader[at].verdict = "";
+   return(at);
+  }
+
+void UpdateLeaderboard(const string sym, const int score, const string verdict)
+  {
+   const int at = LeaderIndex(sym, true);
+   g_leader[at].score   = score;
+   g_leader[at].verdict = verdict;
+  }
+
+//+------------------------------------------------------------------+
+//| Drop leaderboard rows for symbols no longer covered by any open    |
+//| chart (a closed chart's last score would otherwise linger forever).|
+//+------------------------------------------------------------------+
+void PruneLeaderboard()
+  {
+   int kept  = 0;
+   int total = ArraySize(g_leader);
+   for(int i = 0; i < total; i++)
+     {
+      bool alive = false;
+      for(int c = 0; c < ArraySize(g_charts); c++)
+         if(ChartSymbol(g_charts[c].chart_id) == g_leader[i].symbol)
+           {
+            alive = true;
+            break;
+           }
+      if(alive)
+        {
+         if(kept != i)
+            g_leader[kept] = g_leader[i];
+         kept++;
+        }
+     }
+   if(kept != total)
+      ArrayResize(g_leader, kept);
+  }
+
+//+------------------------------------------------------------------+
+//| Draw the top InpLeaderboardRows rows (by Master Score, descending)  |
+//| as a compact HUD block. Returns the number of lines drawn so the    |
+//| caller can advance its own y cursor.                                 |
+//+------------------------------------------------------------------+
+int RenderLeaderboard(const long chart_id, const int y0)
+  {
+   const int n = ArraySize(g_leader);
+   if(n == 0)
+      return(0);
+
+   SLeaderRow sorted[];
+   ArrayResize(sorted, n);
+   for(int i = 0; i < n; i++)
+      sorted[i] = g_leader[i];
+   for(int a = 0; a < n - 1; a++)
+      for(int b = 0; b < n - 1 - a; b++)
+         if(sorted[b + 1].score > sorted[b].score)
+           {
+            SLeaderRow tmp = sorted[b];
+            sorted[b]      = sorted[b + 1];
+            sorted[b + 1]  = tmp;
+           }
+
+   const int rows = MathMin(n, MathMax(1, InpLeaderboardRows));
+   string joined = "LEADER ";
+   for(int i = 0; i < rows; i++)
+     {
+      const color c = (sorted[i].verdict == "GO") ? COL_TARGET :
+                      (sorted[i].verdict == "WAIT" ? COL_KZ_LON : COL_LIQ);
+      joined += (i == 0 ? "" : "  ") + IntegerToString(i + 1) + "." + sorted[i].symbol + " " +
+               (sorted[i].score >= 0 ? IntegerToString(sorted[i].score) : "-");
+     }
+   UpsertLabel(chart_id, OBJ_PREFIX + "HUD_LEADER", HUD_X, y0, joined, COL_LIQ,
+               LEADERBOARD_FONT, "Arial", CORNER_LEFT_UPPER);
+   return(1);
+  }
+
+//+------------------------------------------------------------------+
+//| Nearest killzone transition (an open or a close) from server time,  |
+//| independent of whether killzone shading itself is enabled.          |
+//+------------------------------------------------------------------+
+void ComputeSessionCountdown(string &label)
+  {
+   label = "";
+   const datetime now = TimeTradeServer();
+   if(now <= 0)
+      return;
+   MqlDateTime dtNow;
+   TimeToStruct(now, dtNow);
+   const datetime dayStart = now - (dtNow.hour * 3600 + dtNow.min * 60 + dtNow.sec);
+
+   string names[3]  = {"ASIA", "LONDON", "NY"};
+   int    starts[3] = {InpKZAsiaStart, InpKZLondonStart, InpKZNewYorkStart};
+   int    lens[3]   = {MathMax(1, InpKZLengthHours) * 2, MathMax(1, InpKZLengthHours),
+                       MathMax(1, InpKZLengthHours)};
+
+   datetime bestTime = 0;
+   string   bestLabel = "";
+   for(int i = 0; i < 3; i++)
+     {
+      datetime s = dayStart + (long)MathMax(0, starts[i]) * 3600;
+      datetime e = s + (long)lens[i] * 3600;
+      while(e <= now)          // roll forward until this session's window is ahead of now
+        {
+         s += 86400;
+         e += 86400;
+        }
+      datetime candTime; string candLabel;
+      if(now < s)
+        {
+         candTime  = s;
+         candLabel = names[i] + " opens in ";
+        }
+      else
+        {
+         candTime  = e;
+         candLabel = names[i] + " closes in ";
+        }
+      if(bestTime == 0 || candTime < bestTime)
+        {
+         bestTime  = candTime;
+         bestLabel = candLabel;
+        }
+     }
+   if(bestTime == 0)
+      return;
+   const long remain = (long)(bestTime - now);
+   const int  hh = (int)(remain / 3600);
+   const int  mm = (int)((remain % 3600) / 60);
+   label = "NEXT: " + bestLabel + (hh > 0 ? IntegerToString(hh) + "h" : "") + IntegerToString(mm) + "m";
   }
 
 /* ================================================================== */
@@ -5288,6 +6125,38 @@ void AppendZenithJSON(CJsonWriter &w)
       w.AddNum("dOpen", g_zen.dOpen, _Digits);
    if(g_zen.wOpen > 0.0)
       w.AddNum("wOpen", g_zen.wOpen, _Digits);
+   if(g_zen.planShiftWarn)
+      w.AddRaw("planShiftWarn", "true");
+   if(g_zen.volRegime != "")
+     {
+      w.Add("volRegime", g_zen.volRegime);
+      if(g_zen.suggestedRiskPct > 0.0)
+         w.AddNum("suggestedRiskPct", g_zen.suggestedRiskPct, 2);
+     }
+   if(g_zen.statsTrades > 0)
+     {
+      w.AddNum("statsWinPct", g_zen.statsWinPct, 1);
+      w.AddNum("statsExpectancyR", g_zen.statsExpectancyR, 2);
+      w.AddNum("statsTrades", g_zen.statsTrades, 0);
+     }
+   if(ArraySize(g_leader) > 0)
+     {
+      string lb = "[";
+      for(int i = 0; i < ArraySize(g_leader); i++)
+        {
+         if(i > 0)
+            lb += ",";
+         lb += "{\"symbol\":\"" + BridgeJsonEscape(g_leader[i].symbol) + "\",\"score\":" +
+               IntegerToString(g_leader[i].score) + ",\"verdict\":\"" +
+               BridgeJsonEscape(g_leader[i].verdict) + "\"}";
+        }
+      lb += "]";
+      w.AddRaw("leaderboard", lb);
+     }
+   string nextSession = "";
+   ComputeSessionCountdown(nextSession);
+   if(nextSession != "")
+      w.Add("nextSession", nextSession);
    if(ArraySize(g_tunerKeys) > 0)
      {
       string joined = "";
