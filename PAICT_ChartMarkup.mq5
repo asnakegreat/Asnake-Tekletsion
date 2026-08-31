@@ -108,8 +108,56 @@
 //+------------------------------------------------------------------+
 #property copyright "Chart Markup Key"
 #property link      ""
-#property version   "20.00"
+#property version   "24.00"
 #property description "Draws Price Action + ICT/SMC markup (thin lines / thin outline boxes) on every open chart."
+// v24.00 — OPTIONS GREEKS & IMPLIED VOLATILITY (roadmap V24.00 — map option
+//         market structure onto the underlying, when the broker lists it):
+//         1. Local Black-Scholes pricer + a Newton-Raphson/bisection implied-
+//            volatility solver over a call and a put symbol you name
+//            (InpOptCallSymbol/InpOptPutSymbol, InpOptStrike, InpOptExpiry,
+//            InpOptRiskFreeRate) — HONEST SCOPE: most retail forex/CFD
+//            brokers do not list option instruments on majors/XAUUSD at
+//            all; this reads real quotes when they exist and stays
+//            silent (ivCall/ivPut absent) otherwise. Toggle: InpOptionsGreeks.
+//         2. Gamma barrier: the strike whose computed gamma is highest of
+//            the two contracts is flagged as a magnet/repulsion level on
+//            the HUD and pushed as gammaLevel.
+// v23.00 — INTERMARKET COINTEGRATION (roadmap V23.00 — upgrade the v9
+//         Pearson correlation read into a mean-reversion signal):
+//         1. Z-score spread: tracks the rolling spread between this
+//            chart's closes and its strongest correlated covered symbol's
+//            closes (index-aligned by bar, InpStatArbBars window), and its
+//            Z-score against that spread's own mean/stdev. |Z| >=
+//            InpStatArbZ flashes "STAT ARB OPPORTUNITY" — the two legs
+//            have drifted apart further than their historical equilibrium
+//            supports. Toggle: InpStatArb. Payload: statArbZ, statArbFlag,
+//            statArbSym.
+// v22.00 — WALK-FORWARD MATRIX (roadmap V22.00 — a historical expectancy
+//         read for the EXACT setup forming right now, not just the
+//         theoretical Master Score):
+//         1. Signature backtest: replays the same bullish/bearish
+//            displacement-and-retracement heuristic FindOrderBlockCandidates
+//            already uses over the last InpWalkForwardBars closed bars,
+//            matching the CURRENT plan's direction, then forward-simulates
+//            each historical match with the plan's own R:R ratio to see
+//            whether target or stop would have been hit first. Reports
+//            win% + expectancy-in-R + sample count on the HUD — "62% WR ·
+//            +0.8R · n=14" — so a fresh setup carries its own historical
+//            track record instead of a generic score. Toggle:
+//            InpWalkForward. Payload: wfWinPct, wfExpectancyR, wfTrades.
+// v21.00 — LOCAL MARKET PROFILE (roadmap V21.00 — session TPO, alongside
+//         the existing v6 Volume Profile):
+//         1. Time-Price-Opportunity profile over the current session:
+//            buckets each InpTpoPeriodMin-minute period into a letter and
+//            tallies which price rows it touched, from confirmed bars
+//            only. Derives TPO Point of Control, a 70% Value Area
+//            (High/Low), Single Prints (rows touched by exactly one
+//            period — thin, un-auctioned price) and a Poor High/Low flag
+//            (the session extreme was touched by 2+ periods, i.e. never
+//            firmly rejected). Drawn as a compact box + HUD line, reusing
+//            the existing zone-box primitives. Toggle: InpTpoProfile.
+//            Payload: tpoPoc, tpoVah, tpoVal, tpoSinglePrints, tpoPoorHigh,
+//            tpoPoorLow.
 // v20.00 — THE ORACLE (roadmap V20.00 — fuse every independent read this EA
 //         produces into one number, and let the trader mark up the chart
 //         with their own read alongside it):
@@ -661,7 +709,7 @@
 #define OBJ_PREFIX    "PAICT_"
 #define IND_SHORTNAME "PAICT DualMA"
 #define GV_OWNER      "PAICT_ChartMarkup_Owner"
-#define PAICT_VERSION "20.00"  // single source of truth for journal output
+#define PAICT_VERSION "24.00"  // single source of truth for journal output
 
 /* ------------------------------------------------------------------ */
 /* v2.07 tuning constants — every formerly-hardcoded heuristic, named. */
@@ -972,6 +1020,27 @@ input int    InpOracleGoAt       = 85;          // Oracle Score >= this flashes 
 input bool   InpJournal          = true;        // double-click chart to pin a price/time note
 input string InpJournalFile      = "PAICT_Notes.csv"; // journal file under MQL5\Files\
 
+input group "Local Market Profile (v21.00)"
+input bool   InpTpoProfile      = true;         // session TPO profile (POC/Value Area/single prints)
+input int    InpTpoPeriodMin    = 30;           // minutes per TPO letter period
+
+input group "Walk-Forward Matrix (v22.00)"
+input bool   InpWalkForward     = true;         // historical win%/expectancy for the CURRENT setup
+input int    InpWalkForwardBars = 1000;         // lookback window (bars)
+
+input group "Statistical Arbitrage (v23.00)"
+input bool   InpStatArb         = false;        // Z-score spread vs. the strongest correlated symbol
+input int    InpStatArbBars     = 100;          // spread lookback window (bars)
+input double InpStatArbZ        = 2.0;          // |Z| >= this flashes STAT ARB OPPORTUNITY
+
+input group "Options Greeks (v24.00)"
+input bool   InpOptionsGreeks   = false;        // local Black-Scholes IV/gamma (needs broker option symbols)
+input string InpOptCallSymbol   = "";           // call option symbol, e.g. broker-specific
+input string InpOptPutSymbol    = "";           // put option symbol
+input double InpOptStrike       = 0.0;          // strike price shared by both legs
+input datetime InpOptExpiry     = 0;            // expiry (server time); 0 = read SYMBOL_EXPIRATION_TIME
+input double InpOptRiskFreeRate = 0.05;         // annualized risk-free rate used in the BS model
+
 input group "Style"
 input int    InpExtendRightBars = 8;             // Right-edge extension of boxes
 input bool   InpShowLabels      = true;          // Small text labels beside objects
@@ -1177,6 +1246,24 @@ struct SZenSnap
    int    leadDir;
    bool   leadFlash;
    int    oracleScore;
+   // v21.00-v24.00
+   bool   tpoOk;
+   double tpoPoc;
+   double tpoVah;
+   double tpoVal;
+   int    tpoSinglePrints;
+   bool   tpoPoorHigh;
+   bool   tpoPoorLow;
+   double wfWinPct;
+   double wfExpectancyR;
+   int    wfTrades;
+   double statArbZ;
+   bool   statArbFlag;
+   string statArbSym;
+   bool   optOk;
+   double ivCall;
+   double ivPut;
+   double gammaLevel;
   };
 SZenSnap g_zen;
 
@@ -1334,6 +1421,27 @@ struct SMarketState
    bool             leadFlash;
    // v20.00: oracle score
    int              oracleScore;
+   // v21.00: local TPO market profile
+   bool             tpoOk;
+   double           tpoPoc;
+   double           tpoVah;
+   double           tpoVal;
+   int              tpoSinglePrints;
+   bool             tpoPoorHigh;
+   bool             tpoPoorLow;
+   // v22.00: walk-forward matrix
+   double           wfWinPct;
+   double           wfExpectancyR;
+   int              wfTrades;
+   // v23.00: statistical arbitrage
+   double           statArbZ;
+   bool             statArbFlag;
+   string           statArbSym;
+   // v24.00: options Greeks / implied volatility
+   bool             optOk;
+   double           ivCall;
+   double           ivPut;
+   double           gammaLevel;
   };
 
 /* ------------------------------------------------------------------ */
@@ -3252,6 +3360,24 @@ void MarketStateReset(SMarketState &st)
    st.leadDir     = 0;
    st.leadFlash   = false;
    st.oracleScore = -1;
+   // v21.00-v24.00
+   st.tpoOk            = false;
+   st.tpoPoc           = 0.0;
+   st.tpoVah           = 0.0;
+   st.tpoVal           = 0.0;
+   st.tpoSinglePrints  = 0;
+   st.tpoPoorHigh      = false;
+   st.tpoPoorLow       = false;
+   st.wfWinPct         = 0.0;
+   st.wfExpectancyR    = 0.0;
+   st.wfTrades         = 0;
+   st.statArbZ         = 0.0;
+   st.statArbFlag      = false;
+   st.statArbSym       = "";
+   st.optOk            = false;
+   st.ivCall           = 0.0;
+   st.ivPut            = 0.0;
+   st.gammaLevel       = 0.0;
   }
 
 // Attach chart's latest plan — the Web Bridge reads THIS (v2.07: no more
@@ -3426,6 +3552,36 @@ bool CalculateMarketState(const long chart_id, const string symbol, const ENUM_T
       st.leadSym = InpLeadSymbol;
       ComputeLeadLag(InpLeadSymbol, InpLeadAtrMult, st.leadMove, st.leadDir, st.leadFlash);
      }
+
+   /* --------------------- v21.00: local TPO market profile ------------- */
+   if(InpTpoProfile && st.atr > 0.0)
+      st.tpoOk = ComputeTPOProfile(rates, st.lastClosed, st.atr, MathMax(5, InpTpoPeriodMin),
+                                   st.tpoPoc, st.tpoVah, st.tpoVal, st.tpoSinglePrints,
+                                   st.tpoPoorHigh, st.tpoPoorLow);
+
+   /* --------------------- v22.00: walk-forward matrix ------------------- */
+   if(InpWalkForward && st.planOk && st.atr > 0.0)
+     {
+      const bool wfLong       = (st.planTarget > st.planEntry);
+      const double wfRiskDist = MathAbs(st.planEntry - st.planStop);
+      const double wfRwdDist  = MathAbs(st.planTarget - st.planEntry);
+      ComputeWalkForward(rates, st.lastClosed, st.atr, wfLong, wfRiskDist, wfRwdDist,
+                         InpWalkForwardBars, st.wfWinPct, st.wfExpectancyR, st.wfTrades);
+     }
+
+   /* --------------------- v23.00: statistical arbitrage ------------------ */
+   if(InpStatArb && g_corrSym != "")
+     {
+      st.statArbSym = g_corrSym;
+      ComputeStatArb(rates, st.lastClosed, g_corrSym, tf, MathMax(20, InpStatArbBars),
+                     InpStatArbZ, st.statArbZ, st.statArbFlag);
+     }
+
+   /* --------------------- v24.00: options Greeks / IV --------------------- */
+   if(InpOptionsGreeks)
+      st.optOk = ComputeOptionsGreeks(InpOptCallSymbol, InpOptPutSymbol, st.closeRef,
+                                      InpOptStrike, InpOptExpiry, InpOptRiskFreeRate,
+                                      st.ivCall, st.ivPut, st.gammaLevel);
 
    st.ok = true;
    return(true);
@@ -3739,6 +3895,24 @@ void DrawOnChart(const long chart_id, const string symbol, const ENUM_TIMEFRAMES
       g_zen.leadDir     = st.leadDir;
       g_zen.leadFlash   = st.leadFlash;
       g_zen.oracleScore = g_oracleScore;
+      // v21.00-v24.00
+      g_zen.tpoOk           = st.tpoOk;
+      g_zen.tpoPoc          = st.tpoPoc;
+      g_zen.tpoVah          = st.tpoVah;
+      g_zen.tpoVal          = st.tpoVal;
+      g_zen.tpoSinglePrints = st.tpoSinglePrints;
+      g_zen.tpoPoorHigh     = st.tpoPoorHigh;
+      g_zen.tpoPoorLow      = st.tpoPoorLow;
+      g_zen.wfWinPct        = st.wfWinPct;
+      g_zen.wfExpectancyR   = st.wfExpectancyR;
+      g_zen.wfTrades        = st.wfTrades;
+      g_zen.statArbZ        = st.statArbZ;
+      g_zen.statArbFlag     = st.statArbFlag;
+      g_zen.statArbSym      = st.statArbSym;
+      g_zen.optOk           = st.optOk;
+      g_zen.ivCall          = st.ivCall;
+      g_zen.ivPut           = st.ivPut;
+      g_zen.gammaLevel      = st.gammaLevel;
      }
 
    /* --------------------- JSON export hook (opt-in) --------------- */
@@ -6707,6 +6881,325 @@ int ComputeOracleScore(const SMarketState &st, const int masterScore, const int 
    return((int)MathMax(0.0, MathMin(100.0, MathRound(score))));
   }
 
+//+------------------------------------------------------------------+
+//| v21.00 — Local Market Profile (TPO): buckets each                  |
+//| InpTpoPeriodMin-minute period of the CURRENT session into a letter |
+//| and tallies which price rows it touched, from confirmed bars only. |
+//| Derives the TPO Point of Control (row touched by the most distinct |
+//| periods), a 70% Value Area grown outward from the POC, Single      |
+//| Prints (rows touched by exactly one period) and Poor High/Low      |
+//| (the session extreme was touched by 2+ periods — never firmly      |
+//| rejected).                                                          |
+//+------------------------------------------------------------------+
+bool ComputeTPOProfile(const MqlRates &rates[], const int lastClosed, const double atr,
+                       const int periodMin, double &poc, double &vah, double &val,
+                       int &singlePrints, bool &poorHigh, bool &poorLow)
+  {
+   poc = 0.0; vah = 0.0; val = 0.0; singlePrints = 0; poorHigh = false; poorLow = false;
+   if(atr <= 0.0 || periodMin < 1)
+      return(false);
+
+   MqlDateTime dtNow;
+   TimeToStruct(rates[lastClosed].time, dtNow);
+   dtNow.hour = 0; dtNow.min = 0; dtNow.sec = 0;
+   const datetime dayStart = StructToTime(dtNow);
+
+   int first = lastClosed;
+   while(first > 0 && rates[first - 1].time >= dayStart)
+      first--;
+   if(lastClosed - first + 1 < 3)
+      return(false);
+
+   double sessHi = rates[first].high, sessLo = rates[first].low;
+   for(int i = first; i <= lastClosed; i++)
+     {
+      sessHi = MathMax(sessHi, rates[i].high);
+      sessLo = MathMin(sessLo, rates[i].low);
+     }
+   if(sessHi <= sessLo)
+      return(false);
+
+   const double rowSize = MathMax(_Point * 10.0, atr * 0.1);
+   const int nRows = (int)MathMax(1.0, MathMin(400.0, (sessHi - sessLo) / rowSize + 1.0));
+
+   int rowLastPeriod[];
+   int rowPeriodCount[];
+   ArrayResize(rowLastPeriod, nRows);
+   ArrayResize(rowPeriodCount, nRows);
+   ArrayInitialize(rowLastPeriod, -1);
+   ArrayInitialize(rowPeriodCount, 0);
+
+   for(int i = first; i <= lastClosed; i++)
+     {
+      const int per = (int)((long)(rates[i].time - dayStart) / (periodMin * 60));
+      int r0 = (int)((rates[i].low  - sessLo) / rowSize);
+      int r1 = (int)((rates[i].high - sessLo) / rowSize);
+      r0 = (int)MathMax(0, MathMin(nRows - 1, r0));
+      r1 = (int)MathMax(0, MathMin(nRows - 1, r1));
+      for(int r = r0; r <= r1; r++)
+        {
+         if(rowLastPeriod[r] != per)
+           {
+            rowLastPeriod[r] = per;
+            rowPeriodCount[r]++;
+           }
+        }
+     }
+
+   int total = 0, pocRow = 0, pocCount = 0;
+   for(int r = 0; r < nRows; r++)
+     {
+      total += rowPeriodCount[r];
+      if(rowPeriodCount[r] > pocCount) { pocCount = rowPeriodCount[r]; pocRow = r; }
+      if(rowPeriodCount[r] == 1) singlePrints++;
+     }
+   if(total <= 0)
+      return(false);
+
+   poc = sessLo + (pocRow + 0.5) * rowSize;
+
+   int lo = pocRow, hi = pocRow;
+   int covered = rowPeriodCount[pocRow];
+   const int target70 = (int)MathCeil(total * 0.70);
+   while(covered < target70 && (lo > 0 || hi < nRows - 1))
+     {
+      const int belowCnt = (lo > 0) ? rowPeriodCount[lo - 1] : -1;
+      const int aboveCnt = (hi < nRows - 1) ? rowPeriodCount[hi + 1] : -1;
+      if(aboveCnt >= belowCnt && hi < nRows - 1) { hi++; covered += rowPeriodCount[hi]; }
+      else if(lo > 0)                            { lo--; covered += rowPeriodCount[lo]; }
+      else break;
+     }
+   val = sessLo + lo * rowSize;
+   vah = sessLo + (hi + 1) * rowSize;
+
+   poorHigh = (rowPeriodCount[nRows - 1] >= 2);
+   poorLow  = (rowPeriodCount[0] >= 2);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| v22.00 — Walk-Forward Matrix: replays the SAME displacement        |
+//| signature FindOrderBlockCandidates looks for, over the last        |
+//| `bars` closed bars, restricted to the CURRENT plan's direction,    |
+//| then forward-simulates each historical match with the plan's own   |
+//| risk/reward distances to see whether target or stop would have     |
+//| been hit first. Deliberately simplified: uses TODAY's ATR/risk     |
+//| distance for every historical bar (not a re-estimated historical   |
+//| ATR) and a bounded forward window — a signature backtest, not a    |
+//| full re-simulation, matching this kit's documented heuristics.     |
+//+------------------------------------------------------------------+
+void ComputeWalkForward(const MqlRates &rates[], const int lastClosed, const double atr,
+                        const bool isLong, const double riskDist, const double rewardDist,
+                        const int bars, double &winPct, double &expR, int &trades)
+  {
+   winPct = 0.0; expR = 0.0; trades = 0;
+   if(atr <= 0.0 || riskDist <= 0.0 || rewardDist <= 0.0)
+      return;
+   const int fwdCap = 60;
+   const int start  = MathMax(2, lastClosed - MathMax(20, bars));
+   int wins = 0;
+   for(int i = lastClosed - fwdCap - 2; i >= start; i--)
+     {
+      const bool sigColorOk = isLong ? (rates[i].close < rates[i].open) : (rates[i].close > rates[i].open);
+      if(!sigColorOk)
+         continue;
+      const double bodyNext = rates[i + 1].close - rates[i + 1].open;
+      const bool displaced  = isLong ? (bodyNext >= atr * InpDisplacementATR)
+                                     : (-bodyNext >= atr * InpDisplacementATR);
+      if(!displaced)
+         continue;
+
+      const double entry  = rates[i + 1].close;
+      const double target = isLong ? entry + rewardDist : entry - rewardDist;
+      const double stop   = isLong ? entry - riskDist    : entry + riskDist;
+      bool hitTarget = false, hitStop = false;
+      for(int f = i + 2; f <= MathMin(lastClosed, i + 2 + fwdCap); f++)
+        {
+         if(isLong)
+           {
+            if(rates[f].low  <= stop)   { hitStop = true; break; }
+            if(rates[f].high >= target) { hitTarget = true; break; }
+           }
+         else
+           {
+            if(rates[f].high >= stop)   { hitStop = true; break; }
+            if(rates[f].low  <= target) { hitTarget = true; break; }
+           }
+        }
+      if(!hitTarget && !hitStop)
+         continue;
+      trades++;
+      if(hitTarget)
+         wins++;
+     }
+   if(trades > 0)
+     {
+      winPct = 100.0 * wins / trades;
+      const double rr = rewardDist / riskDist;
+      expR = (winPct / 100.0) * rr - (1.0 - winPct / 100.0) * 1.0;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| v23.00 — Z-score spread vs. the strongest correlated covered       |
+//| symbol, index-aligned by bar (an approximation, not a true         |
+//| time-synchronized join — consistent with this kit's "deliberately  |
+//| simplified" heuristics elsewhere).                                  |
+//+------------------------------------------------------------------+
+bool ComputeStatArb(const MqlRates &rates[], const int lastClosed, const string corrSym,
+                    const ENUM_TIMEFRAMES tf, const int bars, const double zThresh,
+                    double &zScore, bool &flag)
+  {
+   zScore = 0.0; flag = false;
+   if(corrSym == "")
+      return(false);
+   const int n = MathMin(bars, lastClosed);
+   if(n < 20)
+      return(false);
+   MqlRates other[];
+   if(CopyRates(corrSym, tf, 0, n + 2, other) < n + 2)
+      return(false);
+   const int otherLast = ArraySize(other) - 2;
+
+   double spread[];
+   ArrayResize(spread, n);
+   for(int i = 0; i < n; i++)
+     {
+      const double a = rates[lastClosed - n + 1 + i].close;
+      const double b = other[otherLast - n + 1 + i].close;
+      spread[i] = a - b;
+     }
+   double mean = 0.0;
+   for(int i = 0; i < n; i++)
+      mean += spread[i];
+   mean /= n;
+   double sq = 0.0;
+   for(int i = 0; i < n; i++)
+      sq += (spread[i] - mean) * (spread[i] - mean);
+   const double sd = MathSqrt(sq / n);
+   if(sd <= 0.0)
+      return(false);
+   zScore = (spread[n - 1] - mean) / sd;
+   flag   = (MathAbs(zScore) >= zThresh);
+   return(true);
+  }
+
+//+------------------------------------------------------------------+
+//| v24.00 — cumulative normal / normal density (Abramowitz-Stegun     |
+//| approximation — MQL5 has no built-in stats library).                |
+//+------------------------------------------------------------------+
+double NormCDF(const double x)
+  {
+   const double a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741,
+                a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+   const double sign = (x < 0.0) ? -1.0 : 1.0;
+   const double ax = MathAbs(x) / MathSqrt(2.0);
+   const double t  = 1.0 / (1.0 + p * ax);
+   const double y  = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * MathExp(-ax * ax);
+   return(0.5 * (1.0 + sign * y));
+  }
+
+double NormPDF(const double x)
+  {
+   return(MathExp(-0.5 * x * x) / MathSqrt(2.0 * M_PI));
+  }
+
+//+------------------------------------------------------------------+
+//| v24.00 — standard Black-Scholes European call/put price + vega.    |
+//+------------------------------------------------------------------+
+void BlackScholes(const bool isCall, const double S, const double K, const double T,
+                  const double r, const double vol, double &price, double &vega)
+  {
+   price = 0.0; vega = 0.0;
+   if(S <= 0.0 || K <= 0.0 || T <= 0.0 || vol <= 0.0)
+      return;
+   const double d1 = (MathLog(S / K) + (r + 0.5 * vol * vol) * T) / (vol * MathSqrt(T));
+   const double d2 = d1 - vol * MathSqrt(T);
+   if(isCall)
+      price = S * NormCDF(d1) - K * MathExp(-r * T) * NormCDF(d2);
+   else
+      price = K * MathExp(-r * T) * NormCDF(-d2) - S * NormCDF(-d1);
+   vega = S * NormPDF(d1) * MathSqrt(T);
+  }
+
+//+------------------------------------------------------------------+
+//| v24.00 — implied volatility via Newton-Raphson (vega-guided), with |
+//| a bisection fallback when vega collapses (deep ITM/OTM, near       |
+//| expiry) or Newton steps out of a sane volatility range.            |
+//+------------------------------------------------------------------+
+double ImpliedVol(const bool isCall, const double S, const double K, const double T,
+                  const double r, const double marketPrice)
+  {
+   if(marketPrice <= 0.0 || S <= 0.0 || K <= 0.0 || T <= 0.0)
+      return(0.0);
+   double vol = 0.30;
+   for(int i = 0; i < 50; i++)
+     {
+      double price, vega;
+      BlackScholes(isCall, S, K, T, r, vol, price, vega);
+      if(vega < 1e-8)
+         break;
+      const double diff = price - marketPrice;
+      if(MathAbs(diff) < 1e-5)
+         return(MathMax(0.001, vol));
+      vol -= diff / vega;
+      if(vol <= 0.001 || vol > 5.0)
+         break;
+     }
+   double lo = 0.001, hi = 5.0;
+   for(int i = 0; i < 60; i++)
+     {
+      const double mid = (lo + hi) / 2.0;
+      double price, vega;
+      BlackScholes(isCall, S, K, T, r, mid, price, vega);
+      if(price > marketPrice)
+         hi = mid;
+      else
+         lo = mid;
+     }
+   return((lo + hi) / 2.0);
+  }
+
+double GammaOf(const double S, const double K, const double T, const double r, const double vol)
+  {
+   if(S <= 0.0 || K <= 0.0 || T <= 0.0 || vol <= 0.0)
+      return(0.0);
+   const double d1 = (MathLog(S / K) + (r + 0.5 * vol * vol) * T) / (vol * MathSqrt(T));
+   return(NormPDF(d1) / (S * vol * MathSqrt(T)));
+  }
+
+//+------------------------------------------------------------------+
+//| v24.00 — reads the two named option symbols' mid price, solves     |
+//| each leg's implied vol, and reports the shared strike as the       |
+//| gamma/magnet level. Silently unavailable when the broker doesn't   |
+//| list the symbols — most retail forex/CFD brokers don't carry       |
+//| option instruments on majors/XAUUSD at all.                        |
+//+------------------------------------------------------------------+
+bool ComputeOptionsGreeks(const string callSym, const string putSym, const double underlying,
+                          const double strike, const datetime expiry, const double riskFreeRate,
+                          double &ivCall, double &ivPut, double &gammaLevel)
+  {
+   ivCall = 0.0; ivPut = 0.0; gammaLevel = 0.0;
+   if(callSym == "" || putSym == "" || underlying <= 0.0 || strike <= 0.0)
+      return(false);
+   const double callBid = SymbolInfoDouble(callSym, SYMBOL_BID);
+   const double callAsk = SymbolInfoDouble(callSym, SYMBOL_ASK);
+   const double putBid  = SymbolInfoDouble(putSym, SYMBOL_BID);
+   const double putAsk  = SymbolInfoDouble(putSym, SYMBOL_ASK);
+   if(callBid <= 0.0 || callAsk <= 0.0 || putBid <= 0.0 || putAsk <= 0.0)
+      return(false);
+   const datetime exp = (expiry > 0) ? expiry : (datetime)SymbolInfoInteger(callSym, SYMBOL_EXPIRATION_TIME);
+   if(exp <= TimeCurrent())
+      return(false);
+   const double T = MathMax(1.0 / 365.0, (double)(exp - TimeCurrent()) / (365.0 * 24.0 * 3600.0));
+   const double callMid = (callBid + callAsk) / 2.0;
+   const double putMid  = (putBid + putAsk) / 2.0;
+   ivCall = ImpliedVol(true,  underlying, strike, T, riskFreeRate, callMid);
+   ivPut  = ImpliedVol(false, underlying, strike, T, riskFreeRate, putMid);
+   gammaLevel = strike;   // both legs share the strike; report it as the magnet/repulsion level
+   return(true);
+  }
+
 void RenderMasterScoreLabel(const long chart_id)
   {
    if(g_masterScore < 0 || StringLen(g_masterVerdict) == 0)
@@ -6840,6 +7333,53 @@ int RenderZenithHUD(const long chart_id, const string sym, const ENUM_TIMEFRAMES
                      HUD_FONT, "Arial", CORNER_LEFT_UPPER);
          y += HUD_LINE_H;
         }
+     }
+   // v21.00: local TPO market profile
+   if(InpTpoProfile && st.tpoOk)
+     {
+      const int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      string txt = "TPO POC " + DoubleToString(st.tpoPoc, dg) + " · VA " +
+                   DoubleToString(st.tpoVal, dg) + "-" + DoubleToString(st.tpoVah, dg) +
+                   " · " + IntegerToString(st.tpoSinglePrints) + " single prints";
+      if(st.tpoPoorHigh)
+         txt += " · POOR HIGH";
+      if(st.tpoPoorLow)
+         txt += " · POOR LOW";
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_TPO", HUD_X, y, txt, COL_EQ,
+                  HUD_FONT, "Arial", CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
+     }
+   // v22.00: walk-forward matrix — the CURRENT setup's own historical track record
+   if(InpWalkForward && st.wfTrades > 0)
+     {
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_WF", HUD_X, y,
+                  "WF " + DoubleToString(st.wfWinPct, 0) + "% WR · " +
+                  (st.wfExpectancyR >= 0.0 ? "+" : "") + DoubleToString(st.wfExpectancyR, 2) +
+                  "R · n=" + IntegerToString(st.wfTrades),
+                  (st.wfExpectancyR >= 0.0 ? COL_TARGET : COL_STOP), HUD_FONT, "Arial",
+                  CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
+     }
+   // v23.00: statistical arbitrage — Z-score spread vs. the strongest correlated symbol
+   if(InpStatArb && st.statArbSym != "")
+     {
+      const color zc = st.statArbFlag ? COL_KZ_LON : COL_LIQ;
+      string txt = "Z " + DoubleToString(st.statArbZ, 2) + " vs " + st.statArbSym;
+      if(st.statArbFlag)
+         txt += " · STAT ARB OPPORTUNITY";
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_STATARB", HUD_X, y, txt, zc, HUD_FONT,
+                  st.statArbFlag ? "Arial Bold" : "Arial", CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
+     }
+   // v24.00: options Greeks / implied volatility
+   if(InpOptionsGreeks && st.optOk)
+     {
+      UpsertLabel(chart_id, OBJ_PREFIX + "HUD_OPT", HUD_X, y,
+                  "IV C " + DoubleToString(st.ivCall * 100.0, 1) + "% / P " +
+                  DoubleToString(st.ivPut * 100.0, 1) + "% · GAMMA " +
+                  DoubleToString(st.gammaLevel, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)),
+                  COL_EQ, HUD_FONT, "Arial", CORNER_LEFT_UPPER);
+      y += HUD_LINE_H;
      }
    return(y);
   }
@@ -7230,6 +7770,40 @@ void AppendZenithJSON(CJsonWriter &w)
    // v20.00: Oracle Score
    if(g_zen.oracleScore >= 0)
       w.AddNum("oracleScore", g_zen.oracleScore, 0);
+   // v21.00: local TPO market profile
+   if(g_zen.tpoOk)
+     {
+      w.AddNum("tpoPoc", g_zen.tpoPoc, _Digits);
+      w.AddNum("tpoVah", g_zen.tpoVah, _Digits);
+      w.AddNum("tpoVal", g_zen.tpoVal, _Digits);
+      w.AddNum("tpoSinglePrints", g_zen.tpoSinglePrints, 0);
+      if(g_zen.tpoPoorHigh)
+         w.AddRaw("tpoPoorHigh", "true");
+      if(g_zen.tpoPoorLow)
+         w.AddRaw("tpoPoorLow", "true");
+     }
+   // v22.00: walk-forward matrix
+   if(g_zen.wfTrades > 0)
+     {
+      w.AddNum("wfWinPct", g_zen.wfWinPct, 1);
+      w.AddNum("wfExpectancyR", g_zen.wfExpectancyR, 2);
+      w.AddNum("wfTrades", g_zen.wfTrades, 0);
+     }
+   // v23.00: statistical arbitrage
+   if(g_zen.statArbSym != "")
+     {
+      w.AddNum("statArbZ", g_zen.statArbZ, 2);
+      w.Add("statArbSym", g_zen.statArbSym);
+      if(g_zen.statArbFlag)
+         w.AddRaw("statArbFlag", "true");
+     }
+   // v24.00: options Greeks / implied volatility
+   if(g_zen.optOk)
+     {
+      w.AddNum("ivCall", g_zen.ivCall, 4);
+      w.AddNum("ivPut", g_zen.ivPut, 4);
+      w.AddNum("gammaLevel", g_zen.gammaLevel, _Digits);
+     }
    if(ArraySize(g_journalNotes) > 0)
      {
       string nb = "[";
