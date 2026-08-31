@@ -1,91 +1,175 @@
 //+------------------------------------------------------------------+
 //|                                                 PAICT_DualMA.mq5 |
-//|      Companion indicator for PAICT_ChartMarkup — fast/slow SMA   |
+//|                        Chart Markup Key — companion indicator    |
 //|                                                                  |
-//|  Plots two simple moving averages (yellow fast / violet slow) in |
-//|  the main chart window. PAICT_ChartMarkup.mq5 attaches this to   |
-//|  every chart it covers via                                       |
-//|    iCustom(symbol, tf, "PAICT_DualMA", InpFastMAPeriod, InpSlowMAPeriod) |
-//|  purely as a visual reference layer — the EA never reads its     |
-//|  buffers back, and already degrades gracefully (one journal      |
-//|  line, markup keeps drawing) if this indicator is missing or     |
-//|  fails to attach. Deliberately a plain SMA, computed directly    |
-//|  from closed-bar closes with no external handle, to match the    |
-//|  rest of the kit's "deliberately simplified, non-repainting"     |
-//|  philosophy and avoid iMA/CopyBuffer series-order pitfalls.       |
+//|  Renders the fast (yellow) and slow (violet) moving averages    |
+//|  used by the PAICT_ChartMarkup EA. The EA attaches this          |
+//|  indicator automatically to every covered chart via             |
+//|  ChartIndicatorAdd(), which lets the MAs render natively with    |
+//|  their colors baked in instead of being hand-drawn as hundreds   |
+//|  of trend-line segments.                                        |
+//|                                                                  |
+//|  You normally never attach this manually — compiling it into    |
+//|  MQL5\Indicators\ is enough for the EA to find it.               |
 //+------------------------------------------------------------------+
 #property copyright "Chart Markup Key"
 #property link      ""
 #property version   "1.00"
-#property description "Fast/slow SMA companion for PAICT_ChartMarkup."
-
+#property description "Dual MA overlay for the Chart Markup Key suite: fast MA in yellow, slow MA in violet."
 #property indicator_chart_window
 #property indicator_buffers 2
 #property indicator_plots   2
 
-#property indicator_label1  "PAICT Fast MA"
+//--- plot 0 : fast MA -------------------------------------------------
+#property indicator_label1  "MA Fast"
 #property indicator_type1   DRAW_LINE
 #property indicator_color1  clrYellow
 #property indicator_style1  STYLE_SOLID
 #property indicator_width1  1
 
-#property indicator_label2  "PAICT Slow MA"
+//--- plot 1 : slow MA -------------------------------------------------
+#property indicator_label2  "MA Slow"
 #property indicator_type2   DRAW_LINE
-#property indicator_color2  clrViolet
+#property indicator_color2  clrMediumOrchid
 #property indicator_style2  STYLE_SOLID
 #property indicator_width2  1
 
-input int InpFastPeriod = 5;   // Fast MA period
-input int InpSlowPeriod = 15;  // Slow MA period
+//--- inputs
+input group "Moving Averages"
+input int                InpFastPeriod = 5;         // Fast MA period
+input int                InpSlowPeriod = 15;        // Slow MA period
+input ENUM_MA_METHOD     InpMethod     = MODE_EMA;  // MA method
+input ENUM_APPLIED_PRICE InpPriceMode  = PRICE_CLOSE; // Applied price (CLOSE is assumed internally)
 
-double FastBuffer[];
-double SlowBuffer[];
+//--- buffers
+double FastBuf[];
+double SlowBuf[];
+double WorkPrice[]; // applied-price source resolved at runtime
 
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
 int OnInit()
   {
-   SetIndexBuffer(0, FastBuffer, INDICATOR_DATA);
-   SetIndexBuffer(1, SlowBuffer, INDICATOR_DATA);
+   if(InpSlowPeriod <= InpFastPeriod)
+      Print("PAICT_DualMA: slow period (", InpSlowPeriod,
+            ") should exceed fast period (", InpFastPeriod, ")");
+
+   SetIndexBuffer(0, FastBuf, INDICATOR_DATA);
+   SetIndexBuffer(1, SlowBuf, INDICATOR_DATA);
+   ArraySetAsSeries(FastBuf, false);
+   ArraySetAsSeries(SlowBuf, false);
+
+   PlotIndexSetInteger(0, PLOT_DRAW_BEGIN, MathMax(1, InpFastPeriod));
+   PlotIndexSetInteger(1, PLOT_DRAW_BEGIN, MathMax(1, InpSlowPeriod));
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+
+   IndicatorSetInteger(INDICATOR_DIGITS, _Digits);
    IndicatorSetString(INDICATOR_SHORTNAME, "PAICT DualMA");
    return(INIT_SUCCEEDED);
   }
 
 //+------------------------------------------------------------------+
-//| Plain SMA over closed-bar closes — no iMA handle, no CopyBuffer.   |
-//| Only recomputes from the first bar affected by the new/forming    |
-//| bar onward, same incremental pattern every stock indicator uses.  |
+//| Calculation                                                      |
 //+------------------------------------------------------------------+
-int OnCalculate(const int rates_total, const int prev_calculated, const datetime &time[],
-                const double &open[], const double &high[], const double &low[],
-                const double &close[], const long &tick_volume[], const long &volume[],
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
                 const int &spread[])
   {
-   const int fastP = MathMax(1, InpFastPeriod);
-   const int slowP = MathMax(2, InpSlowPeriod);
+   int maxPeriod = InpSlowPeriod;
+   if(InpFastPeriod > maxPeriod)
+      maxPeriod = InpFastPeriod;
+   if(rates_total < maxPeriod + 2)
+      return(0);
 
-   int start = (prev_calculated > 1) ? prev_calculated - 1 : 0;
+   // Resolve applied price once per call into WorkPrice.
+   ArraySetAsSeries(close, false);
+   ArrayResize(WorkPrice, rates_total);
+   for(int b = 0; b < rates_total; b++)
+      WorkPrice[b] = close[b]; // CLOSE-mode resolution (kept explicit for clarity)
+
+   int start = prev_calculated > 0 ? prev_calculated - 1 : 0;
+   if(start < 0)
+      start = 0;
+
    for(int i = start; i < rates_total; i++)
      {
-      if(i >= fastP - 1)
-        {
-         double sum = 0.0;
-         for(int k = 0; k < fastP; k++)
-            sum += close[i - k];
-         FastBuffer[i] = sum / fastP;
-        }
-      else
-         FastBuffer[i] = EMPTY_VALUE;
-
-      if(i >= slowP - 1)
-        {
-         double sum = 0.0;
-         for(int k = 0; k < slowP; k++)
-            sum += close[i - k];
-         SlowBuffer[i] = sum / slowP;
-        }
-      else
-         SlowBuffer[i] = EMPTY_VALUE;
+      FastBuf[i] = CalcMA(i, InpFastPeriod);
+      SlowBuf[i] = CalcMA(i, InpSlowPeriod);
      }
    return(rates_total);
   }
+
+//+------------------------------------------------------------------+
+//| One-bar MA value (SMA / EMA / SMMA / LWMA)                       |
+//+------------------------------------------------------------------+
+double CalcMA(const int i, const int period)
+  {
+   if(period < 1 || i < period - 1 || i >= ArraySize(WorkPrice))
+      return(EMPTY_VALUE);
+
+   double k     = 0.0;
+   double seed  = 0.0;
+   double sum   = 0.0;
+   double wsum  = 0.0;
+   double vsum  = 0.0;
+   double prev  = 0.0;
+   bool   chain = false;
+
+   switch(InpMethod)
+     {
+      case MODE_EMA:
+         k     = 2.0 / (period + 1.0);
+         seed  = SeedAverage(i, period);
+         prev  = (i == period - 1) ? seed : ((period == InpFastPeriod) ? FastBuf[i - 1] : SlowBuf[i - 1]);
+         chain = (prev != EMPTY_VALUE && prev != 0.0);
+         return(chain ? WorkPrice[i] * k + prev * (1.0 - k) : seed);
+
+      case MODE_SMMA:
+         k     = 1.0 / (double)period;
+         seed  = SeedAverage(i, period);
+         prev  = (i == period - 1) ? seed : ((period == InpFastPeriod) ? FastBuf[i - 1] : SlowBuf[i - 1]);
+         chain = (prev != EMPTY_VALUE && prev != 0.0);
+         return(chain ? WorkPrice[i] * k + prev * (1.0 - k) : seed);
+
+      case MODE_LWMA:
+         wsum  = 0.0;
+         vsum  = 0.0;
+         for(int l = 0; l < period; l++)
+           {
+            double w = (double)(l + 1);
+            vsum += WorkPrice[i - period + 1 + l] * w;
+            wsum += w;
+           }
+         return(wsum != 0.0 ? vsum / wsum : EMPTY_VALUE);
+
+      case MODE_SMA:
+      default:
+         sum = 0.0;
+         for(int s = 0; s < period; s++)
+            sum += WorkPrice[i - s];
+         return(sum / period);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| SMA seed for the first smoothed bar                              |
+//+------------------------------------------------------------------+
+double SeedAverage(const int i, const int period)
+  {
+   if(i < period - 1)
+      return(EMPTY_VALUE);
+   double sum = 0.0;
+   for(int j = i - period + 1; j <= i; j++)
+      sum += WorkPrice[j];
+   return(sum / period);
+  }
+//+------------------------------------------------------------------+
