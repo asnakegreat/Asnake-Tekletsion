@@ -11,6 +11,7 @@ Files added:
 - `app/alerting.py` — Telegram/webhook alert helper (demo).
 - `requirements.txt` — Python dependencies.
 - `tests/test_position_sizing.py` — unit tests for sizing logic.
+- `calibration_profit_factor.py` — reads `PAICT_Calibration.csv` (written by `PAICT_ChartMarkup.mq5`'s `CalibrationUpdate()`) and reports a per-symbol, R-multiple profit-factor summary of the EA's suggested plans vs. what price actually did. Run `python3 calibration_profit_factor.py /path/to/PAICT_Calibration.csv --help` for options.
 
 Quick start (local)
 
