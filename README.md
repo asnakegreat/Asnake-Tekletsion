@@ -52,6 +52,24 @@ Running tests
 pytest -q
 ```
 
+Usage tracking (Amplitude)
+
+`app/analytics.py` sends usage events to Amplitude. It is off unless `AMPLITUDE_API_KEY` is set, and a failed send never affects the API response.
+
+```bash
+export AMPLITUDE_API_KEY="<your_project_api_key>"   # never commit it
+# optional, EU data residency:
+# export AMPLITUDE_SERVER_URL="https://api.eu.amplitude.com/2/httpapi"
+```
+
+| Event | Sent from | Properties |
+|---|---|---|
+| Signal Received | `POST /api/signals` (valid) | engine, pair, timeframe, direction, confidence, position_sized, notified_subscribers |
+| Signal Rejected | `POST /api/signals` (schema error) | engine, pair, timeframe, reason |
+| Subscription Created | `POST /api/subscribe` | channel, has_pair_filter, has_confidence_filter |
+
+User ids are hashed before sending, and property names containing password, token, secret, balance, account, login or email are dropped.
+
 Notes
 
 - This is a demo scaffold to illustrate validation, sizing, and alerting. Replace the sizing algorithm and alerting with production-grade implementations before using with real capital.

@@ -4,3 +4,6 @@ create_and_push_feature.ps1
 __pycache__/
 *.pyc
 .venv/
+
+# runtime data written by app/main.py (signals, subscriptions)
+data/

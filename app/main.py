@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from .position_sizing import calculate_position_size
 from .alerting import send_alert
+from . import analytics
 
 app = FastAPI(title="Signal Scanner Pro V60 - Subscriptions and Signals")
 DATA_DIR = Path(__file__).resolve().parents[1] / 'data'
@@ -48,6 +49,11 @@ async def ingest_signal(signal: SignalIn, background_tasks: BackgroundTasks):
     try:
         validate(instance=data, schema=SIGNAL_SCHEMA)
     except ValidationError as e:
+        # BackgroundTasks don't run when HTTPException is raised, so send on a thread.
+        analytics.track_async('Signal Rejected', {
+            'engine': data.get('engine'), 'pair': data.get('pair'),
+            'timeframe': data.get('timeframe'), 'reason': 'schema_validation',
+        })
         raise HTTPException(status_code=422, detail=f"Schema validation error: {e.message}")
 
     # persist signal
@@ -83,13 +89,26 @@ async def ingest_signal(signal: SignalIn, background_tasks: BackgroundTasks):
         except Exception:
             continue
 
+    if analytics.enabled():
+        background_tasks.add_task(analytics.track, 'Signal Received', {
+            'engine': data['engine'], 'pair': data['pair'], 'timeframe': data['timeframe'],
+            'direction': data['direction'], 'confidence': data['confidence'],
+            'position_sized': size is not None, 'notified_subscribers': notified,
+        })
+
     return {"signal_id": data['signal_id'], "received_at": datetime.utcnow().isoformat() + 'Z', "position_size": size, 'notified_subscribers': notified}
 
 @app.post('/api/subscribe')
-def subscribe(sub: Subscription):
+def subscribe(sub: Subscription, background_tasks: BackgroundTasks):
     subs = json.loads(SUBS_FILE.read_text())
     subs.append(sub.dict())
     SUBS_FILE.write_text(json.dumps(subs, indent=2))
+    if analytics.enabled():
+        background_tasks.add_task(analytics.track, 'Subscription Created', {
+            'channel': sub.channel,
+            'has_pair_filter': bool(sub.filters.get('pair')),
+            'has_confidence_filter': sub.filters.get('min_confidence') is not None,
+        }, sub.user_id)
     return {'status': 'subscribed', 'subscription': sub.dict()}
 
 @app.get('/api/subscriptions')
