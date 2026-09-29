@@ -9,6 +9,7 @@ from pathlib import Path
 from .position_sizing import calculate_position_size
 from .alerting import send_alert
 from . import analytics
+from . import notion_sink
 
 app = FastAPI(title="Signal Scanner Pro V60 - Subscriptions and Signals")
 DATA_DIR = Path(__file__).resolve().parents[1] / 'data'
@@ -45,7 +46,9 @@ class Subscription(BaseModel):
 
 @app.post('/api/signals')
 async def ingest_signal(signal: SignalIn, background_tasks: BackgroundTasks):
-    data = signal.dict()
+    # Optional fields the sender left out come back as None; the schema types them as
+    # numbers/strings, so drop them before validating instead of rejecting the signal.
+    data = {k: v for k, v in signal.dict().items() if v is not None}
     try:
         validate(instance=data, schema=SIGNAL_SCHEMA)
     except ValidationError as e:
@@ -89,12 +92,17 @@ async def ingest_signal(signal: SignalIn, background_tasks: BackgroundTasks):
         except Exception:
             continue
 
+    payload = data.get('payload') or {}
     if analytics.enabled():
         background_tasks.add_task(analytics.track, 'Signal Received', {
             'engine': data['engine'], 'pair': data['pair'], 'timeframe': data['timeframe'],
             'direction': data['direction'], 'confidence': data['confidence'],
             'position_sized': size is not None, 'notified_subscribers': notified,
+            'action': payload.get('action'), 'strategy': payload.get('strategy'),
+            'late': payload.get('late'),
         })
+    if notion_sink.enabled():
+        background_tasks.add_task(notion_sink.log_signal, data)
 
     return {"signal_id": data['signal_id'], "received_at": datetime.utcnow().isoformat() + 'Z', "position_size": size, 'notified_subscribers': notified}
 
